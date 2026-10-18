@@ -51,12 +51,13 @@ export function evaluateShotQuality(points: TrackPoint[]): ShotQualityResult {
     medianBoard = s[Math.floor(s.length / 2)];
   }
 
-  const MIN_POINTS = 10;
-  const MIN_TRAVEL = 55;
-  const MIN_FEET = 9;
-  const MIN_MS = 500;
+  // 略放寬：漏存真投優先；左溝仍靠 board／feetPerSec 擋
+  const MIN_POINTS = 8;
+  const MIN_TRAVEL = 42;
+  const MIN_FEET = 7;
+  const MIN_MS = 420;
   // 真球約 12–22 mph → 17–32 ft/s；誤鎖溝邊常 <2 ft/s
-  const MIN_FEET_PER_SEC = 2.2;
+  const MIN_FEET_PER_SEC = 1.8;
 
   if (points.length < MIN_POINTS) {
     return {
@@ -171,8 +172,12 @@ export function isDuplicateOfLastShot(
   if (!lastPoints || lastPoints.length < 4) return false;
 
   const sim = pathImageSimilarity(points, lastPoints);
-  // 軌跡幾乎相同（loop 雙存／Strict Mode 雙寫）→ 一律去重
-  if (sim >= 0.82) return true;
+  const ageMs =
+    lastCreatedAt != null ? nowMs - lastCreatedAt : Number.POSITIVE_INFINITY;
+
+  // Strict Mode／同圈雙 flush：高相似只喺短時窗去重。
+  // 唔好永遠擋——demo loop ~8.5s 下一圈軌跡幾乎一樣，要准存。
+  if (sim >= 0.82 && ageMs < 3800) return true;
 
   const qNew = evaluateShotQuality(points);
   const qOld = evaluateShotQuality(lastPoints);
@@ -182,13 +187,13 @@ export function isDuplicateOfLastShot(
     Math.abs(qNew.medianBoard - qOld.medianBoard) < 4;
   const spanClose = Math.abs(qNew.feetSpan - qOld.feetSpan) < 8;
 
-  // 牆鐘窗口拉長到 ~一圈 demo（8.5s），捕捉「每圈存兩次」
-  if (lastCreatedAt != null && nowMs - lastCreatedAt < 7500) {
-    if (sim >= 0.68 && boardClose && spanClose) return true;
-    if (boardClose && spanClose && sim >= 0.55) return true;
+  // 中時窗：捕捉同圈誤觸第二次存（冷卻 2.2s + 餘裕）；唔蓋過一圈
+  if (ageMs < 5200) {
+    if (sim >= 0.72 && boardClose && spanClose) return true;
+    if (boardClose && spanClose && sim >= 0.62) return true;
   }
 
-  // 軌跡起點影像距離極近且時長相近
+  // 軌跡起點影像距離極近且時長相近（僅短時）
   const a0 = points[0]?.image;
   const b0 = lastPoints[0]?.image;
   if (!a0 || !b0) return false;
@@ -199,6 +204,13 @@ export function isDuplicateOfLastShot(
     lastPoints.length >= 2
       ? lastPoints[lastPoints.length - 1].t - lastPoints[0].t
       : 0;
-  if (d0 < 36 && Math.abs(dtNew - dtOld) < 800 && sim >= 0.5) return true;
+  if (
+    ageMs < 3800 &&
+    d0 < 36 &&
+    Math.abs(dtNew - dtOld) < 800 &&
+    sim >= 0.5
+  ) {
+    return true;
+  }
   return false;
 }

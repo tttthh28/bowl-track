@@ -316,8 +316,19 @@ export function trackBallFrame(
   // 自動鎖定：高分圓形色球 + 位置有位移（避免鎖死導引線／反光）
   const LOCK_SCORE = 65;
   if (blob) {
-    state.recentCenters.push({ x: blob.cx, y: blob.cy });
-    if (state.recentCenters.length > 12) state.recentCenters.shift();
+    const lastC = state.recentCenters[state.recentCenters.length - 1];
+    if (
+      !state.locked &&
+      lastC &&
+      Math.hypot(blob.cx - lastC.x, blob.cy - lastC.y) > 220
+    ) {
+      // 未鎖定時超大跳（假斑↔真球）：清歷史，避免 towardPins 被毒化
+      state.recentCenters = [{ x: blob.cx, y: blob.cy }];
+      state.lockStreak = 0;
+    } else {
+      state.recentCenters.push({ x: blob.cx, y: blob.cy });
+      if (state.recentCenters.length > 12) state.recentCenters.shift();
+    }
   }
   const motionSpan = (() => {
     const pts = state.recentCenters;

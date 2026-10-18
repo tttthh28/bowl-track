@@ -29,6 +29,7 @@ export type EstimateExtrapolated = {
   pocket?: boolean;
   impactAngle?: boolean;
   impactSpeed?: boolean;
+  arrows?: boolean;
 };
 
 export type ShotEstimate = {

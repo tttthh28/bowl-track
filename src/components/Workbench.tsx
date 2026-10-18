@@ -18,6 +18,7 @@ import { computeShotEstimate } from "@/lib/estimates";
 import {
   detectLaneFromCanvas,
   fallbackDefaultCorners,
+  scoreLaneGeometry,
 } from "@/lib/laneDetect";
 import {
   BallTrackerState,
@@ -199,32 +200,89 @@ export default function Workbench() {
     return canvas;
   }, []);
 
-  const runAutoDetect = useCallback(() => {
+  const runAutoDetect = useCallback(async () => {
     setError(null);
     setDetecting(true);
     setDetectMsg(null);
+    const v = videoRef.current;
+    if (!v?.videoWidth) {
+      setError("尚無影像，請先開啟鏡頭或上傳影片");
+      setDetecting(false);
+      return;
+    }
+    const wasPaused = v.paused;
+    const restoreT = v.currentTime;
+    const seekTo = (t: number) =>
+      new Promise<void>((resolve) => {
+        const done = () => {
+          v.removeEventListener("seeked", done);
+          resolve();
+        };
+        v.addEventListener("seeked", done);
+        try {
+          v.currentTime = Math.max(0, Math.min(t, (v.duration || t) - 0.05));
+        } catch {
+          resolve();
+        }
+        // 有啲瀏覽器唔觸發 seeked
+        setTimeout(done, 120);
+      });
+
     try {
-      const canvas = grabFrameToCanvas();
-      const v = videoRef.current;
-      if (!canvas || !v?.videoWidth) {
-        setError("尚無影像，請先開啟鏡頭或上傳影片");
-        return;
+      // 上傳片：一定 multi-seek，用幾何分揀最好（唔好只信第一幀信心）
+      const dur = Number.isFinite(v.duration) && v.duration > 1 ? v.duration : 0;
+      const tryTimes =
+        sourceModeRef.current === "upload" && dur > 0
+          ? Array.from(
+              new Set(
+                [
+                  0.05,
+                  Math.min(0.4, dur * 0.05),
+                  Math.min(1.0, dur * 0.12),
+                  Math.min(dur * 0.25, dur - 0.15),
+                  Math.min(dur * 0.4, dur - 0.15),
+                  Math.min(dur * 0.55, dur - 0.15),
+                  restoreT,
+                ].map((x) => Math.max(0, Math.min(x, Math.max(0, dur - 0.08))))
+              )
+            )
+          : [restoreT, restoreT, restoreT];
+
+      let result: ReturnType<typeof detectLaneFromCanvas> = null;
+      let bestScore = -1e9;
+      for (const tSeek of tryTimes) {
+        if (sourceModeRef.current === "upload" && dur > 0) {
+          await seekTo(tSeek);
+        }
+        const canvas = grabFrameToCanvas();
+        if (!canvas) continue;
+        const next = detectLaneFromCanvas(canvas);
+        if (!next) continue;
+        const sc = scoreLaneGeometry(
+          next,
+          v.videoWidth,
+          v.videoHeight
+        );
+        if (sc > bestScore) {
+          bestScore = sc;
+          result = next;
+        }
+        // 好幾何＋夠信心可提早停
+        if (sc >= 95 && next.confidence >= 0.7) break;
       }
-      // 同一幀可能因曝光／球影失敗；連抽最多 3 次（短延遲重繪）
-      let result = detectLaneFromCanvas(canvas);
-      if (!result || result.confidence < 0.4) {
-        for (let attempt = 0; attempt < 2 && (!result || result.confidence < 0.4); attempt++) {
-          const again = grabFrameToCanvas();
-          if (!again) break;
-          const next = detectLaneFromCanvas(again);
-          if (
-            next &&
-            (!result || next.confidence >= result.confidence)
-          ) {
-            result = next;
+
+      // 還原播放位置
+      if (sourceModeRef.current === "upload" && dur > 0) {
+        await seekTo(restoreT);
+        if (!wasPaused) {
+          try {
+            void v.play();
+          } catch {
+            /* ignore */
           }
         }
       }
+
       if (!result) {
         const fb = fallbackDefaultCorners(v.videoWidth, v.videoHeight);
         persistCorners(fb);

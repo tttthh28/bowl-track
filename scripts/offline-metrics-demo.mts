@@ -21,7 +21,7 @@ import { computeShotEstimate } from "../src/lib/estimates.ts";
 import {
   evaluateShotQuality,
 } from "../src/lib/shotQuality.ts";
-import { detectLaneCorners } from "../src/lib/laneDetect.ts";
+import { detectLaneCorners, scoreLaneGeometry } from "../src/lib/laneDetect.ts";
 
 const ROOT = join(import.meta.dirname, "..");
 const VIDEO = join(ROOT, "test-media/bowling-demo.mp4");
@@ -39,14 +39,99 @@ execSync(
 const raw = readFileSync(`${OUT}/seq.rgba`);
 const frameBytes = W * H * 4;
 
-// 用中段幀自動偵測（片頭／曝光差時第 0 幀易失敗）
-let det: ReturnType<typeof detectLaneCorners> = null;
-for (const fi of [24, 16, 8, 0]) {
+// 多幀候選：幾何分先行，再以短追蹤探針揀 medBoard／覆蓋較合理者
+type Cand = { det: NonNullable<ReturnType<typeof detectLaneCorners>>; geom: number; fi: number };
+const cands: Cand[] = [];
+for (const fi of [0, 4, 8, 12, 16, 20, 24, 30, 40, 48, 60]) {
   const off = fi * frameBytes;
   if (off + frameBytes > raw.length) continue;
-  const slice = new Uint8ClampedArray(raw.buffer, raw.byteOffset + off, frameBytes);
-  det = detectLaneCorners(new Uint8ClampedArray(slice), W, H);
-  if (det && det.confidence >= 0.5) break;
+  const slice = new Uint8ClampedArray(
+    raw.buffer,
+    raw.byteOffset + off,
+    frameBytes
+  );
+  const cand = detectLaneCorners(new Uint8ClampedArray(slice), W, H);
+  if (!cand || cand.confidence < 0.4) continue;
+  cands.push({ det: cand, geom: scoreLaneGeometry(cand, W, H), fi });
+}
+cands.sort((a, b) => b.geom - a.geom);
+const top = cands.slice(0, Math.min(5, cands.length));
+
+function probeTrack(corners: import("../src/lib/types.ts").LaneCorners) {
+  const Hm = buildHomography(corners);
+  if (!Hm)
+    return { med: null as number | null, maxFeet: 0, minFeet: 99, locks: 0 };
+  const state = new BallTrackerState();
+  const settings = { ...DEFAULT_TRACKER, sensitivity: 26, minBlobPixels: 28 };
+  const boards: number[] = [];
+  let maxFeet = 0;
+  let minFeet = 99;
+  let locks = 0;
+  const nProbe = Math.min(Math.floor(raw.length / frameBytes), 110);
+  for (let f = 0; f < nProbe; f++) {
+    const rgba = new Uint8ClampedArray(
+      raw.buffer,
+      raw.byteOffset + f * frameBytes,
+      frameBytes
+    );
+    const copy = new Uint8ClampedArray(rgba);
+    const gray = rgbaToGray(copy, W, H);
+    const res = trackBallFrame(
+      state,
+      gray,
+      W,
+      H,
+      settings,
+      corners,
+      1000 / FPS,
+      copy
+    );
+    if (res.locked && res.smoothed) {
+      locks++;
+      const lane = imageToLane(Hm, res.smoothed);
+      if (lane.board >= 1.5 && lane.board <= 37.5) {
+        boards.push(lane.board);
+        if (lane.feet > maxFeet) maxFeet = lane.feet;
+        if (lane.feet < minFeet) minFeet = lane.feet;
+      }
+    }
+  }
+  const med =
+    boards.length > 0
+      ? [...boards].sort((a, b) => a - b)[Math.floor(boards.length / 2)]
+      : null;
+  return { med, maxFeet, minFeet: boards.length ? minFeet : 99, locks };
+}
+
+let det: ReturnType<typeof detectLaneCorners> = null;
+let bestProbe = -1e9;
+for (const c of top.length ? top : cands) {
+  const p = probeTrack(c.det.corners);
+  // medBoard 8–30、覆蓋遠、鎖幀多
+  const pinY = (c.det.corners.tl.y + c.det.corners.tr.y) / 2;
+  const medOk =
+    p.med != null && p.med >= 10 && p.med <= 28
+      ? 35
+      : p.med != null && p.med >= 7 && p.med <= 32
+        ? 15
+        : -50;
+  const coverOk = Math.min(45, Math.max(0, p.maxFeet - p.minFeet));
+  const earlyOk = p.minFeet <= 18 ? 25 : p.minFeet <= 22 ? 8 : -15;
+  const pinPen = pinY < H * 0.12 ? -20 : 0;
+  const score =
+    c.geom +
+    medOk +
+    coverOk +
+    earlyOk +
+    pinPen +
+    Math.min(20, p.locks * 0.12);
+  console.log(
+    `probe fi=${c.fi} geom=${c.geom.toFixed(1)} med=${p.med?.toFixed(1) ?? "—"} ft=${p.minFeet.toFixed(1)}–${p.maxFeet.toFixed(1)} locks=${p.locks} pinY=${pinY.toFixed(0)} → ${score.toFixed(1)}`
+  );
+  if (score > bestProbe) {
+    bestProbe = score;
+    det = c.det;
+  }
 }
 const corners = det?.corners ?? defaultCorners(W, H);
 console.log(

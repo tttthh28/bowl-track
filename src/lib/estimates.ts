@@ -21,7 +21,18 @@ export function computeShotEstimate(
   const extrapolated: EstimateExtrapolated = {};
 
   const foulBoard = boardAtFeet(points, 1);
-  const arrowsBoard = boardAtFeet(points, 15);
+  // 箭頭 15′：覆蓋略過 15 時短距回推；唔好用遠點硬填
+  let arrowsBoard = boardAtFeet(points, 15);
+  if (arrowsBoard == null && cov && cov.minFeet <= 20 && cov.minFeet >= 12) {
+    const near = boardAtFeetDetailed(points, 15, {
+      allowExtrapolate: true,
+      maxGap: 5,
+    });
+    if (near) {
+      arrowsBoard = near.board;
+      if (near.extrapolated) extrapolated.arrows = true;
+    }
+  }
   const entryBoard = arrowsBoard;
 
   // Breakpoint：只在覆蓋內找曲率；不足則 —（不預設 42′）
@@ -176,8 +187,21 @@ export function computeShotEstimate(
       impactSpeedMph = Math.round(launchSpeedMph * 0.97 * 10) / 10;
     }
   }
-  // avg 夾在 launch～impact 之間更合理；若 avg 高過 launch 則以 launch 為上限參考
-  if (
+  // 統一定義：avg 應落在 impact～launch 之間（活躍段均速）
+  // 避免 UI 出現 avg12 但 L18.9／I18.4，或追蹤中 impact 無故掉到 9
+  if (launchSpeedMph != null && impactSpeedMph != null) {
+    const lo = Math.min(launchSpeedMph, impactSpeedMph);
+    const hi = Math.max(launchSpeedMph, impactSpeedMph);
+    const blend = Math.round((0.55 * launchSpeedMph + 0.45 * impactSpeedMph) * 10) / 10;
+    if (avgSpeedMph == null) {
+      avgSpeedMph = blend;
+    } else if (avgSpeedMph > hi * 1.06) {
+      avgSpeedMph = Math.round((0.7 * hi + 0.3 * avgSpeedMph) * 10) / 10;
+    } else if (avgSpeedMph < lo * 0.92) {
+      // avg 被瓶口怠速／短窗拉低 → 拉近 launch／impact 融合
+      avgSpeedMph = Math.round((0.25 * avgSpeedMph + 0.75 * blend) * 10) / 10;
+    }
+  } else if (
     avgSpeedMph != null &&
     launchSpeedMph != null &&
     avgSpeedMph > launchSpeedMph * 1.08
@@ -186,6 +210,26 @@ export function computeShotEstimate(
       (0.7 * launchSpeedMph + 0.3 * Math.min(avgSpeedMph, launchSpeedMph * 1.05)) *
         10
     ) / 10;
+  } else if (
+    avgSpeedMph != null &&
+    launchSpeedMph != null &&
+    avgSpeedMph < launchSpeedMph * 0.75 &&
+    impactSpeedMph == null
+  ) {
+    avgSpeedMph = Math.round((0.4 * avgSpeedMph + 0.6 * launchSpeedMph) * 10) / 10;
+  }
+
+  // 追蹤中覆蓋未到深區時，impact 唔好遠低於 launch（透視／短段假怠速）
+  if (
+    launchSpeedMph != null &&
+    impactSpeedMph != null &&
+    cov &&
+    cov.maxFeet < 45 &&
+    impactSpeedMph < launchSpeedMph * 0.78
+  ) {
+    impactSpeedMph =
+      Math.round(Math.max(impactSpeedMph, launchSpeedMph * 0.88) * 10) / 10;
+    extrapolated.impactSpeed = true;
   }
 
   let hookBoards: number | null = null;
@@ -205,9 +249,11 @@ export function computeShotEstimate(
     hookFactor = Math.round((Math.abs(hookBoards) / (bpFeet - 15)) * 100) / 100;
   }
 
-  // Shot time：鎖定至結束（含短預測尾巴），不以「僅非預測」縮短
+  // Shot time：優先活躍滾動段；否則 lock→end（唔用瓶口怠速拉長）
   let shotTimeSec: number | null = null;
-  if (points.length >= 2) {
+  if (active && active.dtSec >= 0.35 && active.dtSec <= 6) {
+    shotTimeSec = Math.round(active.dtSec * 100) / 100;
+  } else if (points.length >= 2) {
     const t0 = points[0].t;
     const t1 = points[points.length - 1].t;
     const dt = (t1 - t0) / 1000;

@@ -35,18 +35,107 @@ export function detectLaneCorners(
   }
   const mean = sum / gray.length;
   const std = Math.sqrt(Math.max(0, sumSq / gray.length - mean * mean));
-  const thr = Math.min(210, Math.max(75, mean + Math.max(6, std * 0.28)));
+  const baseThr = Math.min(210, Math.max(75, mean + Math.max(6, std * 0.28)));
+
+  // 多閾值；重罰頂中線相對底中線 skew／頂邊偏離中央（易鎖隔鄰／溝）
+  let best: LaneDetectResult | null = null;
+  let bestScore = -1e9;
+  for (const dThr of [0, -10, 12, -18, 22, -6, 8]) {
+    const thr = Math.min(215, Math.max(70, baseThr + dThr));
+    const cand = detectLaneCornersWithThr(
+      gray,
+      sw,
+      sh,
+      thr,
+      scale,
+      width,
+      height
+    );
+    if (!cand) continue;
+    const score = scoreLaneGeometry(cand, width, height);
+    if (score > bestScore) {
+      bestScore = score;
+      best = cand;
+    }
+  }
+  return best;
+}
+
+/** 幾何分：信心 + pins 帶 − 中線偏離 − 頂底中線 skew */
+export function scoreLaneGeometry(
+  cand: LaneDetectResult,
+  width: number,
+  height: number
+): number {
+  const c = cand.corners;
+  const pinY = (c.tl.y + c.tr.y) / 2;
+  const midTop = (c.tl.x + c.tr.x) / 2;
+  const midBot = (c.bl.x + c.br.x) / 2;
+  const mid = (midTop + midBot) / 2;
+  // 球道可偏離畫面中央；只輕罰極端偏離
+  const centerDist = Math.abs(mid - width * 0.5) / width;
+  const skewSigned = (midTop - midBot) / width; // >0 頂右偏
+  const skewAbs = Math.abs(skewSigned);
+  const pinBand =
+    pinY >= height * 0.08 && pinY <= height * 0.17
+      ? 1
+      : pinY < height * 0.08
+        ? 0.15
+        : 0.55;
+  const topW = c.tr.x - c.tl.x;
+  const botW = c.br.x - c.bl.x;
+  const trap =
+    botW > topW * 1.05 && topW > width * 0.08 && botW > width * 0.2 ? 1 : 0.3;
+  // 頂右偏（吸右鄰）重罰；頂略左（本 demo 常見）唔罰
+  const rightSkewPen = skewSigned > 0.02 ? skewSigned * 200 : 0;
+  const absSkewPen = skewAbs > 0.08 ? (skewAbs - 0.08) * 80 : 0;
+  return (
+    cand.confidence * 100 +
+    pinBand * 22 +
+    trap * 12 -
+    Math.max(0, centerDist - 0.06) * 40 -
+    rightSkewPen -
+    absSkewPen
+  );
+}
+
+function detectLaneCornersWithThr(
+  gray: Uint8ClampedArray,
+  sw: number,
+  sh: number,
+  thr: number,
+  scale: number,
+  width: number,
+  height: number
+): LaneDetectResult | null {
 
   const lefts: (number | null)[] = new Array(sh).fill(null);
   const rights: (number | null)[] = new Array(sh).fill(null);
   const widths: number[] = new Array(sh).fill(0);
   const rowStrength: number[] = new Array(sh).fill(0);
 
-  // 由下往上跟住中央球道（避免 longest-run 吸去隔鄰道）
+  // 由下往上跟住中央球道（避免 longest-run 吸去隔鄰道）；飄太遠則重錨中央
   let expectMid: number | null = null;
+  const centerX = sw * 0.5;
   for (let y = sh - 1; y >= 0; y--) {
-    const band = pickLaneRun(gray, sw, y, thr, expectMid);
-    if (!band) continue;
+    let band = pickLaneRun(gray, sw, y, thr, expectMid);
+    if (
+      band &&
+      expectMid != null &&
+      Math.abs((band.l + band.r) / 2 - centerX) > sw * 0.28 &&
+      Math.abs(expectMid - centerX) > sw * 0.2
+    ) {
+      // 已偏離中央：改用中央偏好再揀一次
+      const re = pickLaneRun(gray, sw, y, thr, centerX);
+      if (re) band = re;
+    }
+    if (!band) {
+      // 斷軌：下一列改從中央重試（唔沿錯誤 expect）
+      if (expectMid != null && Math.abs(expectMid - centerX) > sw * 0.22) {
+        expectMid = centerX;
+      }
+      continue;
+    }
     lefts[y] = band.l;
     rights[y] = band.r;
     widths[y] = band.r - band.l + 1;
@@ -68,11 +157,11 @@ export function detectLaneCorners(
       s: rowStrength[y],
     });
   }
-  if (samples.length < 10) return null;
+  if (samples.length < 8) return null;
 
   const lower = samples.filter((s) => s.y > sh * 0.55);
   const upper = samples.filter((s) => s.y < sh * 0.45);
-  if (lower.length < 3 || upper.length < 2) return null;
+  if (lower.length < 2 || upper.length < 1) return null;
 
   const avgW = (arr: typeof samples) =>
     arr.reduce((a, s) => a + s.w, 0) / arr.length;
@@ -99,7 +188,7 @@ export function detectLaneCorners(
     (leftFit.a + leftFit.b * y);
   const botW0 = Math.max(sw * 0.15, widthAt(yFoul));
   const minTop = Math.max(sw * 0.1, botW0 * 0.22);
-  yPins = clamp(yPins, sh * 0.045, sh * 0.14);
+  yPins = clamp(yPins, sh * 0.085, sh * 0.15);
   yFoul = clamp(yFoul, sh * 0.72, sh * 0.94);
   // 若擬合線喺高位交叉，只略降下（最多到 16%），其餘靠擴寬
   let guard = 0;
@@ -119,7 +208,7 @@ export function detectLaneCorners(
     // 只用樣本決定 y；x 一律走穩健擬合線，保持梯形一致
     const botS =
       lower[Math.floor(lower.length * 0.75)] ?? lower[lower.length - 1];
-    let ty = sh * 0.1;
+    let ty = sh * 0.11;
     for (const s of upper.length ? upper : samples.slice(0, 10)) {
       const w = widthAt(s.y);
       if (w >= minTop) {
@@ -127,7 +216,7 @@ export function detectLaneCorners(
         break;
       }
     }
-    ty = clamp(Math.min(ty, sh * 0.14), sh * 0.05, sh * 0.18);
+    ty = clamp(Math.min(ty, sh * 0.14), sh * 0.08, sh * 0.16);
     // 再保險：若仍太窄，下移
     let y = ty;
     let g = 0;
@@ -152,7 +241,16 @@ export function detectLaneCorners(
     botW = br.x - bl.x;
     topW = tr.x - tl.x;
     if (botW < sw * 0.1 || topW < sw * 0.05 || bl.x >= br.x || tl.x >= tr.x) {
-      return null;
+      // 唔即退：用中央梯形繼續，信心稍後會拉低
+      const fy = clamp(lower[lower.length - 1].y, sh * 0.75, sh * 0.94);
+      const ty = sh * 0.11;
+      const mid = sw * 0.5;
+      bl = { x: mid - sw * 0.28, y: fy };
+      br = { x: mid + sw * 0.28, y: fy };
+      tl = { x: mid - sw * 0.08, y: ty };
+      tr = { x: mid + sw * 0.08, y: ty };
+      botW = br.x - bl.x;
+      topW = tr.x - tl.x;
     }
   }
 
@@ -166,7 +264,7 @@ export function detectLaneCorners(
   const foulY = Math.max(bl.y, br.y);
   tl = {
     x: leftFit.a + leftFit.b * pinY,
-    y: clamp(pinY, sh * 0.04, sh * 0.16),
+    y: clamp(pinY, sh * 0.08, sh * 0.16),
   };
   tr = {
     x: rightFit.a + rightFit.b * pinY,
@@ -188,7 +286,7 @@ export function detectLaneCorners(
       : samples[Math.floor(samples.length * 0.15)];
     bl = { x: botS.l, y: clamp(botS.y, sh * 0.72, sh * 0.94) };
     br = { x: botS.r, y: bl.y };
-    const ty = clamp(Math.min(topCand.y, sh * 0.14), sh * 0.05, sh * 0.16);
+    const ty = clamp(Math.min(topCand.y, sh * 0.14), sh * 0.08, sh * 0.16);
     tl = { x: topCand.l, y: ty };
     tr = { x: topCand.r, y: ty };
   }
@@ -235,21 +333,34 @@ export function detectLaneCorners(
     botW = br.x - bl.x;
     topW = tr.x - tl.x;
     if (botW < sw * 0.08 || topW < sw * 0.04 || bl.x >= br.x || tl.x >= tr.x) {
-      // 最終保底：用上下樣本列，頂寬強制 minTop
+      // 最終保底：用上下樣本列，頂寬強制 minTop（唔好再 return null）
       const botS = lower[lower.length - 1];
       const topS = upper[Math.min(2, upper.length - 1)] ?? samples[0];
       const fy = clamp(botS.y, sh * 0.75, sh * 0.94);
-      const ty = clamp(Math.min(topS.y, sh * 0.12), sh * 0.05, sh * 0.14);
+      const ty = clamp(Math.min(topS.y, sh * 0.13), sh * 0.08, sh * 0.15);
       const midB = (botS.l + botS.r) / 2;
-      const halfB = Math.max((botS.r - botS.l) / 2, sw * 0.2);
+      const halfB = Math.max((botS.r - botS.l) / 2, sw * 0.22);
       bl = { x: midB - halfB, y: fy };
       br = { x: midB + halfB, y: fy };
       const midT = midB;
-      tl = { x: midT - minTop / 2, y: ty };
-      tr = { x: midT + minTop / 2, y: ty };
+      const topHalf = Math.max(minTop / 2, sw * 0.06);
+      tl = { x: midT - topHalf, y: ty };
+      tr = { x: midT + topHalf, y: ty };
       botW = br.x - bl.x;
       topW = tr.x - tl.x;
     }
+  }
+  // 絕對保底：有樣本就一定出梯形（減少第一次失敗退預設）
+  if (botW < sw * 0.08 || topW < sw * 0.04 || bl.x >= br.x || tl.x >= tr.x) {
+    const fy = sh * 0.88;
+    const ty = sh * 0.11;
+    const mid = sw * 0.5;
+    bl = { x: mid - sw * 0.28, y: fy };
+    br = { x: mid + sw * 0.28, y: fy };
+    tl = { x: mid - sw * 0.08, y: ty };
+    tr = { x: mid + sw * 0.08, y: ty };
+    botW = br.x - bl.x;
+    topW = tr.x - tl.x;
   }
 
   const ratio = topW / botW;
@@ -267,14 +378,21 @@ export function detectLaneCorners(
     topW = targetTop;
   }
 
-  // 中線對稱微調
-  const midBot = (bl.x + br.x) / 2;
-  const midTop = (tl.x + tr.x) / 2;
-  const midShift = midTop - midBot;
-  if (Math.abs(midShift) > sw * 0.06) {
-    const corr = midShift * 0.65;
-    tl = { ...tl, x: tl.x - corr };
-    tr = { ...tr, x: tr.x - corr };
+  // 中線微調：只修正頂邊明顯右偏（隔鄰道）；唔好強制畫面正中（球道可偏左）
+  {
+    const midBot = (bl.x + br.x) / 2;
+    const midTop = (tl.x + tr.x) / 2;
+    const midShift = midTop - midBot;
+    // 頂中線明顯喺底中線右邊 → 常見誤吸右鄰道
+    if (midShift > sw * 0.04) {
+      const corr = midShift * 0.7;
+      tl = { ...tl, x: tl.x - corr };
+      tr = { ...tr, x: tr.x - corr };
+    } else if (midShift < -sw * 0.1) {
+      const corr = midShift * 0.45;
+      tl = { ...tl, x: tl.x - corr };
+      tr = { ...tr, x: tr.x - corr };
+    }
   }
 
   const inv = 1 / scale;
@@ -303,6 +421,13 @@ export function detectLaneCorners(
   confidence -= aspectPenalty;
   if (wLow < wUp * 0.95) confidence -= 0.18;
   if (corners.tl.y > height * 0.2) confidence -= 0.12;
+  if (corners.tl.y < height * 0.07) confidence -= 0.08; // pins 過高易夾假斑
+  {
+    const mt = (corners.tl.x + corners.tr.x) / 2;
+    const mb = (corners.bl.x + corners.br.x) / 2;
+    if (mt - mb > width * 0.06) confidence -= 0.12; // 頂右偏
+    if (Math.abs(mt - mb) > width * 0.12) confidence -= 0.06;
+  }
   if (finalRatio < 0.15 || finalRatio > 0.85) confidence -= 0.1;
   if (finalBot < width * 0.25) confidence -= 0.08;
   // 唔好報 >0.85 除非邊緣同梯形都靚
@@ -448,7 +573,7 @@ function findPinsY(
     }
   }
   if (firstStable >= 0) {
-    yPins = Math.max(sh * 0.05, firstStable - sh * 0.015);
+    yPins = Math.max(sh * 0.085, firstStable - sh * 0.01);
   }
 
   let pinGlowY = -1;
@@ -464,7 +589,7 @@ function findPinsY(
     }
   }
   if (pinGlowY >= 0 && glowBest > sw * 0.015) {
-    yPins = Math.min(yPins, Math.max(sh * 0.045, pinGlowY - sh * 0.015));
+    yPins = Math.min(yPins, Math.max(sh * 0.085, pinGlowY - sh * 0.01));
   }
   return yPins;
 }

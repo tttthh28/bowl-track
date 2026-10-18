@@ -620,16 +620,68 @@ export function feetAtMaxHook(
   const cov = trajectoryCoverage(points);
   if (!cov || cov.span < 6) return null;
 
-  const searchLo = Math.max(12, Math.ceil(cov.minFeet));
-  const searchHi = Math.min(52, Math.floor(cov.maxFeet));
+  // BP 典型 30–45′；覆蓋足夠時優先呢個帶，避免中段噪點假極值
+  let searchLo = Math.max(12, Math.ceil(cov.minFeet));
+  let searchHi = Math.min(52, Math.floor(cov.maxFeet));
+  if (cov.maxFeet >= 32 && cov.span >= 10) {
+    searchLo = Math.max(searchLo, 28);
+    searchHi = Math.min(searchHi, 48);
+  }
+  if (searchHi - searchLo < 5) {
+    searchLo = Math.max(12, Math.ceil(cov.minFeet));
+    searchHi = Math.min(52, Math.floor(cov.maxFeet));
+  }
   if (searchHi - searchLo < 5) return null;
 
-  const samples: { feet: number; board: number }[] = [];
-  for (let f = searchLo; f <= searchHi; f += 2) {
+  const rawSamples: { feet: number; board: number }[] = [];
+  for (let f = searchLo; f <= searchHi; f += 1) {
     const b = boardAtFeet(points, f);
-    if (b != null) samples.push({ feet: f, board: b });
+    if (b != null) rawSamples.push({ feet: f, board: b });
   }
-  if (samples.length < 4) return null;
+  if (rawSamples.length < 4) return null;
+
+  // 丟離群 board（溝邊噪點）
+  const medBoard0 = [...rawSamples.map((s) => s.board)].sort(
+    (a, b) => a - b
+  )[Math.floor(rawSamples.length / 2)];
+  const filtered = rawSamples.filter(
+    (s) => Math.abs(s.board - medBoard0) <= 10
+  );
+  const base = filtered.length >= 4 ? filtered : rawSamples;
+
+  // 3 點平滑減噪
+  const samples = base.map((s, i, arr) => {
+    if (i === 0 || i === arr.length - 1) return s;
+    return {
+      feet: s.feet,
+      board: (arr[i - 1].board + s.board + arr[i + 1].board) / 3,
+    };
+  });
+
+  // 優先：橫向極值（RH 鈎＝最小 board；LH＝最大 board）
+  const earlyN = Math.max(2, Math.floor(samples.length * 0.35));
+  const earlyBoards = samples.slice(0, earlyN).map((s) => s.board);
+  const midEarly =
+    earlyBoards.reduce((a, b) => a + b, 0) / earlyBoards.length;
+  const lateBoards = samples.slice(-earlyN).map((s) => s.board);
+  const midLate =
+    lateBoards.reduce((a, b) => a + b, 0) / lateBoards.length;
+  const hookLeft = midLate <= midEarly; // 往左鈎 → 搵 min board
+
+  let extIdx = 0;
+  let extBoard = samples[0].board;
+  for (let i = 1; i < samples.length; i++) {
+    const b = samples[i].board;
+    if (hookLeft ? b < extBoard : b > extBoard) {
+      extBoard = b;
+      extIdx = i;
+    }
+  }
+  // 極值要有足夠橫移（≥0.6 board），否則改曲率
+  const boardTravel = Math.abs(extBoard - midEarly);
+  if (boardTravel >= 0.6 && extIdx >= 1 && extIdx < samples.length - 1) {
+    return samples[extIdx].feet;
+  }
 
   let bestFeet = samples[Math.floor(samples.length / 2)].feet;
   let bestCurv = -1;

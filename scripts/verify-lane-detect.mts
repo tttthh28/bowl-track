@@ -10,7 +10,7 @@
 import { execSync } from "child_process";
 import { readFileSync, mkdirSync, existsSync } from "fs";
 import { join } from "path";
-import { detectLaneCorners } from "../src/lib/laneDetect.ts";
+import { detectLaneCorners, scoreLaneGeometry } from "../src/lib/laneDetect.ts";
 import {
   BallTrackerState,
   DEFAULT_TRACKER,
@@ -104,7 +104,7 @@ console.log(
   }%`
 );
 
-assert(dets.length >= N * 0.45, `detect ≥45% frames (got ${dets.length}/${N})`);
+assert(dets.length >= N * 0.8, `detect ≥80% frames (got ${dets.length}/${N})`);
 
 const mid = dets.filter((d) => d.f >= 8 && d.f <= 40);
 assert(mid.length >= 4, `enough mid-video detections (${mid.length})`);
@@ -139,7 +139,20 @@ if (badGeom) {
 }
 
 // 用首個成功偵測四角跑追蹤，檢查球點多數在框內
-const seed = dets.find((d) => d.f >= 6) ?? dets[0];
+// 用幾何分揀 seed，避頂右偏鎖溝
+let seed = dets[0];
+let seedScore = -1e9;
+for (const d of dets) {
+  const sc = scoreLaneGeometry(
+    { corners: d.corners, confidence: d.conf, message: "" },
+    W,
+    H
+  );
+  if (sc > seedScore) {
+    seedScore = sc;
+    seed = d;
+  }
+}
 assert(!!seed, "have a seed detection");
 if (seed) {
   const corners = seed.corners;
