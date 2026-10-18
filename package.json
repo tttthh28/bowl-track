@@ -10,7 +10,9 @@
     "verify:tracker": "tsx scripts/verify-tracker-run.mts",
     "db:push": "drizzle-kit push",
     "db:studio": "drizzle-kit studio",
-    "score:accuracy": "tsx scripts/score-accuracy.mts"
+    "score:accuracy": "tsx scripts/score-accuracy.mts",
+    "verify:lane": "tsx scripts/verify-lane-detect.mts",
+    "verify:offline-metrics": "tsx scripts/offline-metrics-demo.mts"
   },
   "dependencies": {
     "@neondatabase/serverless": "^1.2.0",

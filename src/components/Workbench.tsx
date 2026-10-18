@@ -92,6 +92,10 @@ export default function Workbench() {
   const loopGenRef = useRef(0);
   /** 已存檔嘅 loop 世代；同世代唔可再存 */
   const savedLoopGenRef = useRef(-1);
+  /** 避免 setState updater 內副作用（Strict Mode 會雙寫） */
+  const sessionRef = useRef<SessionRecord | null>(null);
+  /** 上次偵測到回繞嘅 performance.now，防抖 */
+  const lastRewindAtRef = useRef(0);
 
   const [session, setSession] = useState<SessionRecord | null>(null);
   const [sourceMode, setSourceMode] = useState<SourceMode>("idle");
@@ -125,6 +129,9 @@ export default function Workbench() {
   useEffect(() => {
     sourceModeRef.current = sourceMode;
   }, [sourceMode]);
+  useEffect(() => {
+    sessionRef.current = session;
+  }, [session]);
 
   useEffect(() => {
     let cancelled = false;
@@ -203,7 +210,21 @@ export default function Workbench() {
         setError("尚無影像，請先開啟鏡頭或上傳影片");
         return;
       }
-      const result = detectLaneFromCanvas(canvas);
+      // 同一幀可能因曝光／球影失敗；連抽最多 3 次（短延遲重繪）
+      let result = detectLaneFromCanvas(canvas);
+      if (!result || result.confidence < 0.4) {
+        for (let attempt = 0; attempt < 2 && (!result || result.confidence < 0.4); attempt++) {
+          const again = grabFrameToCanvas();
+          if (!again) break;
+          const next = detectLaneFromCanvas(again);
+          if (
+            next &&
+            (!result || next.confidence >= result.confidence)
+          ) {
+            result = next;
+          }
+        }
+      }
       if (!result) {
         const fb = fallbackDefaultCorners(v.videoWidth, v.videoHeight);
         persistCorners(fb);
@@ -408,11 +429,22 @@ export default function Workbench() {
     };
     setLiveEstimate(estimate);
     setLivePath(points.filter((p) => p.lane).map((p) => p.lane!));
-    setSession((prev) => {
-      if (!prev) return prev;
-      const updated = appendShot(prev.id, shot);
-      return updated ?? { ...prev, shots: [...prev.shots, shot] };
-    });
+    // appendShot 唔可以放 setState updater（Strict Mode 會跑兩次 → 成對重複）
+    const sid = sessionRef.current?.id;
+    if (sid) {
+      const updated = appendShot(sid, shot);
+      if (updated) {
+        sessionRef.current = updated;
+        setSession(updated);
+      } else {
+        setSession((prev) => {
+          if (!prev) return prev;
+          const next = { ...prev, shots: [...prev.shots, shot] };
+          sessionRef.current = next;
+          return next;
+        });
+      }
+    }
     lastSavedShotRef.current = { points, createdAt: shot.createdAt };
     shotCooldownUntilRef.current = now + 2200;
     if (sourceModeRef.current === "upload") {
@@ -470,16 +502,22 @@ export default function Workbench() {
             : 33;
         lastFrameTRef.current = now;
 
-        // 影片 loop：需明顯回繞（避免緩衝微跳誤觸發多存）
+        // 影片 loop：必須「近尾→近頭」；唔好用單純時間回跳（易誤觸發再開一世代）
         const vt = v.currentTime;
         const prevVt = lastVideoTimeRef.current;
         const dur = Number.isFinite(v.duration) && v.duration > 0 ? v.duration : 0;
+        const nearEnd = dur > 0 ? prevVt > dur * 0.55 : prevVt > 4;
+        const nearStart = vt < Math.min(1.25, dur > 0 ? dur * 0.18 : 1.25);
+        const bigBackJump =
+          dur > 0 && prevVt - vt > Math.max(2.5, dur * 0.35) && nearStart;
         const loopRewound =
           sourceModeRef.current === "upload" &&
-          prevVt > 1.2 &&
-          ((dur > 0 && prevVt > dur * 0.45 && vt < Math.min(1.5, dur * 0.2)) ||
-            prevVt - vt > 2.0);
+          prevVt > 1.5 &&
+          nearEnd &&
+          (nearStart || bigBackJump) &&
+          performance.now() - lastRewindAtRef.current > 900;
         if (loopRewound) {
+          lastRewindAtRef.current = performance.now();
           const alreadySaved =
             loopCycleSavedRef.current ||
             savedLoopGenRef.current === loopGenRef.current;
@@ -726,6 +764,7 @@ export default function Workbench() {
     loopGenRef.current = 0;
     savedLoopGenRef.current = -1;
     lastSavedShotRef.current = null;
+    lastRewindAtRef.current = 0;
     setStatus(
       "等待紫色／暗色球出現…也可直接點球鎖定；消失或影片重播會自動存檔（每圈最多一投）"
     );

@@ -39,9 +39,15 @@ execSync(
 const raw = readFileSync(`${OUT}/seq.rgba`);
 const frameBytes = W * H * 4;
 
-// 用第 1 幀自動偵測四角（失敗則 default）
-const rgba0 = new Uint8ClampedArray(raw.buffer, raw.byteOffset, frameBytes);
-const det = detectLaneCorners(new Uint8ClampedArray(rgba0), W, H);
+// 用中段幀自動偵測（片頭／曝光差時第 0 幀易失敗）
+let det: ReturnType<typeof detectLaneCorners> = null;
+for (const fi of [24, 16, 8, 0]) {
+  const off = fi * frameBytes;
+  if (off + frameBytes > raw.length) continue;
+  const slice = new Uint8ClampedArray(raw.buffer, raw.byteOffset + off, frameBytes);
+  det = detectLaneCorners(new Uint8ClampedArray(slice), W, H);
+  if (det && det.confidence >= 0.5) break;
+}
 const corners = det?.corners ?? defaultCorners(W, H);
 console.log(
   "corners:",
@@ -255,6 +261,16 @@ if (r1.medBoard != null && r1.saved > 0) {
     !evaluateShotQuality(gutter as any).ok,
     "synthetic left-gutter crawl rejected"
   );
+}
+
+// impact ≤ launch（若兩者皆有）
+for (const e of [...r1.saves, ...r2.saves]) {
+  if (e.launchSpeedMph != null && e.impactSpeedMph != null) {
+    assert(
+      e.impactSpeedMph <= e.launchSpeedMph + 0.05,
+      `offline impact≤launch (${e.impactSpeedMph}≤${e.launchSpeedMph})`
+    );
+  }
 }
 
 if (failed) {

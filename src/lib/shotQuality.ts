@@ -142,6 +142,25 @@ export function evaluateShotQuality(points: TrackPoint[]): ShotQualityResult {
   };
 }
 
+/** 抽樣比較兩條影像軌跡相似度（1＝幾乎相同，0＝差很遠） */
+export function pathImageSimilarity(
+  a: TrackPoint[],
+  b: TrackPoint[],
+  samples = 8
+): number {
+  if (a.length < 2 || b.length < 2) return 0;
+  const n = Math.max(3, samples);
+  let sum = 0;
+  for (let i = 0; i < n; i++) {
+    const ta = a[Math.min(a.length - 1, Math.round((i / (n - 1)) * (a.length - 1)))];
+    const tb = b[Math.min(b.length - 1, Math.round((i / (n - 1)) * (b.length - 1)))];
+    sum += Math.hypot(ta.image.x - tb.image.x, ta.image.y - tb.image.y);
+  }
+  const avg = sum / n;
+  // ~40px 平均偏差仍視為高度相似（同片重播）
+  return Math.max(0, Math.min(1, 1 - avg / 55));
+}
+
 /** 與上一投過近（同軌／短時間重複）→ 去重 */
 export function isDuplicateOfLastShot(
   points: TrackPoint[],
@@ -150,19 +169,25 @@ export function isDuplicateOfLastShot(
   nowMs: number
 ): boolean {
   if (!lastPoints || lastPoints.length < 4) return false;
-  // 牆鐘過近（上傳 loop 誤雙存）
-  if (lastCreatedAt != null && nowMs - lastCreatedAt < 2500) {
-    const qNew = evaluateShotQuality(points);
-    const qOld = evaluateShotQuality(lastPoints);
-    if (
-      qNew.medianBoard != null &&
-      qOld.medianBoard != null &&
-      Math.abs(qNew.medianBoard - qOld.medianBoard) < 4 &&
-      Math.abs(qNew.feetSpan - qOld.feetSpan) < 8
-    ) {
-      return true;
-    }
+
+  const sim = pathImageSimilarity(points, lastPoints);
+  // 軌跡幾乎相同（loop 雙存／Strict Mode 雙寫）→ 一律去重
+  if (sim >= 0.82) return true;
+
+  const qNew = evaluateShotQuality(points);
+  const qOld = evaluateShotQuality(lastPoints);
+  const boardClose =
+    qNew.medianBoard != null &&
+    qOld.medianBoard != null &&
+    Math.abs(qNew.medianBoard - qOld.medianBoard) < 4;
+  const spanClose = Math.abs(qNew.feetSpan - qOld.feetSpan) < 8;
+
+  // 牆鐘窗口拉長到 ~一圈 demo（8.5s），捕捉「每圈存兩次」
+  if (lastCreatedAt != null && nowMs - lastCreatedAt < 7500) {
+    if (sim >= 0.68 && boardClose && spanClose) return true;
+    if (boardClose && spanClose && sim >= 0.55) return true;
   }
+
   // 軌跡起點影像距離極近且時長相近
   const a0 = points[0]?.image;
   const b0 = lastPoints[0]?.image;
@@ -174,6 +199,6 @@ export function isDuplicateOfLastShot(
     lastPoints.length >= 2
       ? lastPoints[lastPoints.length - 1].t - lastPoints[0].t
       : 0;
-  if (d0 < 28 && Math.abs(dtNew - dtOld) < 600) return true;
+  if (d0 < 36 && Math.abs(dtNew - dtOld) < 800 && sim >= 0.5) return true;
   return false;
 }

@@ -8,10 +8,12 @@ export type LaneDetectResult = {
   message: string;
 };
 
+/** 標準球道約 60′ × 41.5″ */
+const LANE_ASPECT = (60 * 12) / 41.5;
+
 /**
  * 瀏覽器端球道四角自動偵測（無 OpenCV）。
- * 假設後方視角：下方 foul（較寬）、上方 pins（較窄），球道相對偏亮。
- * 流程：縮圖 → 亮區遮罩 → 每列找左右邊緣 → 擬合梯形四角。
+ * 後方視角：下 foul 較寬、上 pins 較窄；優先揀畫面中央球道（避相鄰道）。
  */
 export function detectLaneCorners(
   rgba: Uint8ClampedArray,
@@ -20,139 +22,261 @@ export function detectLaneCorners(
 ): LaneDetectResult | null {
   if (width < 80 || height < 80) return null;
 
-  // 縮到約 320 寬以加速
   const scale = Math.min(1, 320 / width);
   const sw = Math.max(40, Math.round(width * scale));
   const sh = Math.max(40, Math.round(height * scale));
   const gray = downscaleGray(rgba, width, height, sw, sh);
 
-  // 估計全域亮度，球道通常比 gutter／背景亮
   let sum = 0;
-  for (let i = 0; i < gray.length; i++) sum += gray[i];
+  let sumSq = 0;
+  for (let i = 0; i < gray.length; i++) {
+    sum += gray[i];
+    sumSq += gray[i] * gray[i];
+  }
   const mean = sum / gray.length;
-  const thr = Math.min(220, Math.max(90, mean + 12));
+  const std = Math.sqrt(Math.max(0, sumSq / gray.length - mean * mean));
+  const thr = Math.min(210, Math.max(75, mean + Math.max(6, std * 0.28)));
 
-  // 每列掃描亮區左右邊界（略做平滑）
   const lefts: (number | null)[] = new Array(sh).fill(null);
   const rights: (number | null)[] = new Array(sh).fill(null);
   const widths: number[] = new Array(sh).fill(0);
+  const rowStrength: number[] = new Array(sh).fill(0);
 
-  for (let y = 0; y < sh; y++) {
-    let first = -1;
-    let last = -1;
-    // 要求連續亮段，避免雜點
-    let run = 0;
-    let bestRun = 0;
-    let bestStart = -1;
-    let bestEnd = -1;
-    let runStart = 0;
-    for (let x = 0; x < sw; x++) {
-      const v = gray[y * sw + x];
-      if (v >= thr) {
-        if (run === 0) runStart = x;
-        run++;
-        if (run > bestRun) {
-          bestRun = run;
-          bestStart = runStart;
-          bestEnd = x;
-        }
-      } else {
-        run = 0;
-      }
-    }
-    if (bestRun >= Math.max(8, sw * 0.08)) {
-      first = bestStart;
-      last = bestEnd;
-      lefts[y] = first;
-      rights[y] = last;
-      widths[y] = last - first + 1;
-    }
+  // 由下往上跟住中央球道（避免 longest-run 吸去隔鄰道）
+  let expectMid: number | null = null;
+  for (let y = sh - 1; y >= 0; y--) {
+    const band = pickLaneRun(gray, sw, y, thr, expectMid);
+    if (!band) continue;
+    lefts[y] = band.l;
+    rights[y] = band.r;
+    widths[y] = band.r - band.l + 1;
+    rowStrength[y] = band.strength;
+    expectMid = (band.l + band.r) / 2;
   }
 
-  // 取中下～中上有效列（foul～pins 區間）
-  const yBot = Math.floor(sh * 0.88);
-  const yTop = Math.floor(sh * 0.12);
-  const samples: { y: number; l: number; r: number; w: number }[] = [];
-  for (let y = yTop; y <= yBot; y++) {
+  const yBotScan = Math.floor(sh * 0.94);
+  const yTopScan = Math.floor(sh * 0.06);
+  const samples: { y: number; l: number; r: number; w: number; s: number }[] =
+    [];
+  for (let y = yTopScan; y <= yBotScan; y++) {
     if (lefts[y] == null || rights[y] == null) continue;
     samples.push({
       y,
       l: lefts[y]!,
       r: rights[y]!,
       w: widths[y],
+      s: rowStrength[y],
     });
   }
-  if (samples.length < 12) {
-    return null;
-  }
+  if (samples.length < 10) return null;
 
-  // 期望梯形：下方較寬、上方較窄（後方視角）
   const lower = samples.filter((s) => s.y > sh * 0.55);
-  const upper = samples.filter((s) => s.y < sh * 0.4);
-  if (lower.length < 3 || upper.length < 3) return null;
+  const upper = samples.filter((s) => s.y < sh * 0.45);
+  if (lower.length < 3 || upper.length < 2) return null;
 
   const avgW = (arr: typeof samples) =>
     arr.reduce((a, s) => a + s.w, 0) / arr.length;
   const wLow = avgW(lower);
-  const wUp = avgW(upper);
-  // 若上下寬度幾乎一樣或上更寬，信心降低但仍嘗試
-  let confidence = 0.55;
-  if (wLow > wUp * 1.08) confidence = 0.75;
-  else if (wLow < wUp * 0.95) confidence = 0.35;
+  const wUp = avgW(upper.length ? upper : samples.slice(0, 5));
 
-  // 線性擬合左／右邊緣：x = a + b*y
-  const leftFit = fitLine(
+  const leftFit = fitLineRobust(
     samples.map((s) => s.y),
     samples.map((s) => s.l)
   );
-  const rightFit = fitLine(
+  const rightFit = fitLineRobust(
     samples.map((s) => s.y),
     samples.map((s) => s.r)
   );
   if (!leftFit || !rightFit) return null;
 
-  // pins 端提高（y 更細），避免 TL／TR 過低令球未到瓶口已出四角
-  const yFoul = sh * 0.88;
-  const yPins = sh * 0.08;
+  let yFoul = findFoulY(gray, sw, sh, widths, leftFit, rightFit);
+  let yPins = findPinsY(gray, sw, sh, lefts, rights, widths, yFoul);
+
+  // 優先抬高 pins（TL/TR）；頂寬不足時對稱擴寬，唔好為咗寬度把 y 拉低
+  const widthAt = (y: number) =>
+    rightFit.a +
+    rightFit.b * y -
+    (leftFit.a + leftFit.b * y);
+  const botW0 = Math.max(sw * 0.15, widthAt(yFoul));
+  const minTop = Math.max(sw * 0.1, botW0 * 0.22);
+  yPins = clamp(yPins, sh * 0.045, sh * 0.14);
+  yFoul = clamp(yFoul, sh * 0.72, sh * 0.94);
+  // 若擬合線喺高位交叉，只略降下（最多到 16%），其餘靠擴寬
+  let guard = 0;
+  while (widthAt(yPins) < sw * 0.04 && yPins < sh * 0.16 && guard < 40) {
+    yPins += 1;
+    guard++;
+  }
+
   let bl: Point2D = { x: leftFit.a + leftFit.b * yFoul, y: yFoul };
   let br: Point2D = { x: rightFit.a + rightFit.b * yFoul, y: yFoul };
   let tl: Point2D = { x: leftFit.a + leftFit.b * yPins, y: yPins };
   let tr: Point2D = { x: rightFit.a + rightFit.b * yPins, y: yPins };
 
-  // 合理性檢查
-  const botW = br.x - bl.x;
-  const topW = tr.x - tl.x;
-  if (botW < sw * 0.15 || topW < sw * 0.06) return null;
-  if (bl.x >= br.x || tl.x >= tr.x) return null;
-  if (Math.abs(botW - topW) / sw < 0.02 && confidence > 0.4) {
-    confidence = Math.min(confidence, 0.45);
+  let botW = br.x - bl.x;
+  let topW = tr.x - tl.x;
+  const buildSampleCorners = () => {
+    // 只用樣本決定 y；x 一律走穩健擬合線，保持梯形一致
+    const botS =
+      lower[Math.floor(lower.length * 0.75)] ?? lower[lower.length - 1];
+    let ty = sh * 0.1;
+    for (const s of upper.length ? upper : samples.slice(0, 10)) {
+      const w = widthAt(s.y);
+      if (w >= minTop) {
+        ty = s.y;
+        break;
+      }
+    }
+    ty = clamp(Math.min(ty, sh * 0.14), sh * 0.05, sh * 0.18);
+    // 再保險：若仍太窄，下移
+    let y = ty;
+    let g = 0;
+    while (widthAt(y) < minTop && y < sh * 0.28 && g < 60) {
+      y += 1;
+      g++;
+    }
+    const fy = clamp(botS.y, sh * 0.72, sh * 0.94);
+    return {
+      bl: { x: leftFit.a + leftFit.b * fy, y: fy },
+      br: { x: rightFit.a + rightFit.b * fy, y: fy },
+      tl: { x: leftFit.a + leftFit.b * y, y },
+      tr: { x: rightFit.a + rightFit.b * y, y },
+    };
+  };
+  if (botW < sw * 0.12 || topW < sw * 0.08 || bl.x >= br.x || tl.x >= tr.x) {
+    const s = buildSampleCorners();
+    bl = s.bl;
+    br = { ...s.br, y: s.bl.y };
+    tl = s.tl;
+    tr = s.tr;
+    botW = br.x - bl.x;
+    topW = tr.x - tl.x;
+    if (botW < sw * 0.1 || topW < sw * 0.05 || bl.x >= br.x || tl.x >= tr.x) {
+      return null;
+    }
   }
 
-  // 邊緣強化：foul 端可略偏外側；pins 端避免把 TL／TR 壓入溝／過低
-  bl = nudgeEdge(gray, sw, sh, bl, -1, 0.15);
-  br = nudgeEdge(gray, sw, sh, br, 1, 0.15);
-  tl = nudgeEdge(gray, sw, sh, tl, -1, 0.02);
-  tr = nudgeEdge(gray, sw, sh, tr, 1, 0.02);
-  // 確保 pins 端唔低過畫面 ~6%，foul 端唔高過 ~92%
-  const minPinY = sh * 0.05;
-  const maxFoulY = sh * 0.92;
-  if (tl.y > sh * 0.18) tl = { ...tl, y: sh * 0.1 };
-  if (tr.y > sh * 0.18) tr = { ...tr, y: sh * 0.1 };
-  tl = { ...tl, y: Math.min(tl.y, sh * 0.14) };
-  tr = { ...tr, y: Math.min(tr.y, sh * 0.14) };
-  tl = { ...tl, y: Math.max(minPinY, tl.y) };
-  tr = { ...tr, y: Math.max(minPinY, tr.y) };
-  bl = { ...bl, y: Math.min(maxFoulY, Math.max(bl.y, sh * 0.72)) };
-  br = { ...br, y: Math.min(maxFoulY, Math.max(br.y, sh * 0.72)) };
-  // pins 端至少保持合理頂寬（唔好夾死）
-  const minTopW = sw * 0.12;
-  if (tr.x - tl.x < minTopW) {
+  bl = nudgeEdge(gray, sw, sh, bl, -1, 0.18);
+  br = nudgeEdge(gray, sw, sh, br, 1, 0.18);
+  tl = nudgeEdge(gray, sw, sh, tl, -1, 0.03);
+  tr = nudgeEdge(gray, sw, sh, tr, 1, 0.03);
+
+  // 對齊 y
+  const pinY = Math.min(tl.y, tr.y, sh * 0.16);
+  const foulY = Math.max(bl.y, br.y);
+  tl = {
+    x: leftFit.a + leftFit.b * pinY,
+    y: clamp(pinY, sh * 0.04, sh * 0.16),
+  };
+  tr = {
+    x: rightFit.a + rightFit.b * pinY,
+    y: tl.y,
+  };
+  bl = {
+    x: leftFit.a + leftFit.b * foulY,
+    y: clamp(foulY, sh * 0.72, sh * 0.94),
+  };
+  br = {
+    x: rightFit.a + rightFit.b * foulY,
+    y: bl.y,
+  };
+  // 若對齊後交叉，用樣本
+  if (tr.x - tl.x < sw * 0.09 || br.x - bl.x < sw * 0.12) {
+    const botS = lower[Math.floor(lower.length * 0.75)];
+    const topCand = upper.length
+      ? upper[Math.min(2, upper.length - 1)]
+      : samples[Math.floor(samples.length * 0.15)];
+    bl = { x: botS.l, y: clamp(botS.y, sh * 0.72, sh * 0.94) };
+    br = { x: botS.r, y: bl.y };
+    const ty = clamp(Math.min(topCand.y, sh * 0.14), sh * 0.05, sh * 0.16);
+    tl = { x: topCand.l, y: ty };
+    tr = { x: topCand.r, y: ty };
+  }
+
+  bl = nudgeEdge(gray, sw, sh, bl, -1, 0.12);
+  br = nudgeEdge(gray, sw, sh, br, 1, 0.12);
+  tl = nudgeEdge(gray, sw, sh, { ...tl, y: tl.y }, -1, 0.02);
+  tr = nudgeEdge(gray, sw, sh, { ...tr, y: tr.y }, 1, 0.02);
+  // 保持 pins y 對齊
+  {
+    const y = Math.min(tl.y, tr.y);
+    tl = { ...tl, y };
+    tr = { ...tr, y };
+  }
+  {
+    const y = Math.max(bl.y, br.y);
+    bl = { ...bl, y };
+    br = { ...br, y };
+  }
+
+  botW = br.x - bl.x;
+  topW = tr.x - tl.x;
+  // 頂寬太窄／交叉：對稱擴到 minTop（保持高 pins）
+  if (topW < minTop || tl.x >= tr.x) {
+    const mid = tl.x >= tr.x ? (bl.x + br.x) / 2 : (tl.x + tr.x) / 2;
+    tl = { ...tl, x: mid - minTop / 2 };
+    tr = { ...tr, x: mid + minTop / 2 };
+    topW = minTop;
+  }
+  // foul 端若被 nudge 夾歪，略向外對齊底寬
+  if (botW < sw * 0.2) {
+    const mid = (bl.x + br.x) / 2;
+    const half = Math.max(botW, sw * 0.28) / 2;
+    bl = { ...bl, x: mid - half };
+    br = { ...br, x: mid + half };
+    botW = br.x - bl.x;
+  }
+  if (botW < sw * 0.1 || topW < sw * 0.05 || bl.x >= br.x || tl.x >= tr.x) {
+    const s = buildSampleCorners();
+    bl = s.bl;
+    br = { ...s.br, y: s.bl.y };
+    tl = s.tl;
+    tr = s.tr;
+    botW = br.x - bl.x;
+    topW = tr.x - tl.x;
+    if (botW < sw * 0.08 || topW < sw * 0.04 || bl.x >= br.x || tl.x >= tr.x) {
+      // 最終保底：用上下樣本列，頂寬強制 minTop
+      const botS = lower[lower.length - 1];
+      const topS = upper[Math.min(2, upper.length - 1)] ?? samples[0];
+      const fy = clamp(botS.y, sh * 0.75, sh * 0.94);
+      const ty = clamp(Math.min(topS.y, sh * 0.12), sh * 0.05, sh * 0.14);
+      const midB = (botS.l + botS.r) / 2;
+      const halfB = Math.max((botS.r - botS.l) / 2, sw * 0.2);
+      bl = { x: midB - halfB, y: fy };
+      br = { x: midB + halfB, y: fy };
+      const midT = midB;
+      tl = { x: midT - minTop / 2, y: ty };
+      tr = { x: midT + minTop / 2, y: ty };
+      botW = br.x - bl.x;
+      topW = tr.x - tl.x;
+    }
+  }
+
+  const ratio = topW / botW;
+  if (ratio > 0.92) {
     const mid = (tl.x + tr.x) / 2;
-    tl = { ...tl, x: mid - minTopW / 2 };
-    tr = { ...tr, x: mid + minTopW / 2 };
+    const targetTop = botW * 0.4;
+    tl = { ...tl, x: mid - targetTop / 2 };
+    tr = { ...tr, x: mid + targetTop / 2 };
+    topW = targetTop;
+  } else if (ratio < 0.2) {
+    const mid = (tl.x + tr.x) / 2;
+    const targetTop = Math.max(sw * 0.11, botW * 0.25);
+    tl = { ...tl, x: mid - targetTop / 2 };
+    tr = { ...tr, x: mid + targetTop / 2 };
+    topW = targetTop;
   }
 
-  // 映回原圖座標
+  // 中線對稱微調
+  const midBot = (bl.x + br.x) / 2;
+  const midTop = (tl.x + tr.x) / 2;
+  const midShift = midTop - midBot;
+  if (Math.abs(midShift) > sw * 0.06) {
+    const corr = midShift * 0.65;
+    tl = { ...tl, x: tl.x - corr };
+    tr = { ...tr, x: tr.x - corr };
+  }
+
   const inv = 1 / scale;
   const corners: LaneCorners = {
     tl: clampPt({ x: tl.x * inv, y: tl.y * inv }, width, height),
@@ -161,9 +285,32 @@ export function detectLaneCorners(
     bl: clampPt({ x: bl.x * inv, y: bl.y * inv }, width, height),
   };
 
-  // 覆蓋率：有效列比例
-  const cover = samples.length / (yBot - yTop + 1);
-  confidence = Math.max(0.2, Math.min(0.92, confidence * (0.6 + 0.4 * cover)));
+  // 誠實信心
+  const cover = samples.length / (yBotScan - yTopScan + 1);
+  const trapOk = wLow > wUp * 1.04;
+  const edgeQuality = (leftFit.inlierRatio + rightFit.inlierRatio) / 2;
+  const gradScore = edgeGradientScore(gray, sw, sh, corners, scale);
+  const aspectPenalty = aspectSanityPenalty(corners, width, height);
+  const finalTop = corners.tr.x - corners.tl.x;
+  const finalBot = corners.br.x - corners.bl.x;
+  const finalRatio = finalTop / Math.max(1, finalBot);
+
+  let confidence = 0.22;
+  confidence += trapOk ? 0.18 : 0.04;
+  confidence += 0.18 * edgeQuality;
+  confidence += 0.12 * Math.min(1, cover / 0.5);
+  confidence += 0.16 * gradScore;
+  confidence -= aspectPenalty;
+  if (wLow < wUp * 0.95) confidence -= 0.18;
+  if (corners.tl.y > height * 0.2) confidence -= 0.12;
+  if (finalRatio < 0.15 || finalRatio > 0.85) confidence -= 0.1;
+  if (finalBot < width * 0.25) confidence -= 0.08;
+  // 唔好報 >0.85 除非邊緣同梯形都靚
+  const cap =
+    edgeQuality > 0.75 && trapOk && gradScore > 0.45 && aspectPenalty < 0.05
+      ? 0.88
+      : 0.78;
+  confidence = Math.max(0.12, Math.min(cap, confidence));
 
   return {
     corners,
@@ -175,7 +322,6 @@ export function detectLaneCorners(
   };
 }
 
-/** 從 video／canvas 讀一幀並偵測；失敗回 null */
 export function detectLaneFromCanvas(
   canvas: HTMLCanvasElement
 ): LaneDetectResult | null {
@@ -194,24 +340,161 @@ export function fallbackDefaultCorners(
   return defaultCorners(width, height);
 }
 
-function downscaleGray(
-  rgba: Uint8ClampedArray,
-  w: number,
-  h: number,
+/** 同一列所有夠長亮段，優先接近預期中線（跟住球道） */
+function pickLaneRun(
+  gray: Uint8ClampedArray,
   sw: number,
-  sh: number
-): Uint8ClampedArray {
-  const out = new Uint8ClampedArray(sw * sh);
-  for (let y = 0; y < sh; y++) {
-    const sy = Math.min(h - 1, Math.floor((y / sh) * h));
-    for (let x = 0; x < sw; x++) {
-      const sx = Math.min(w - 1, Math.floor((x / sw) * w));
-      const i = (sy * w + sx) * 4;
-      out[y * sw + x] =
-        (rgba[i] * 77 + rgba[i + 1] * 150 + rgba[i + 2] * 29) >> 8;
+  y: number,
+  thr: number,
+  expectMid: number | null
+): { l: number; r: number; strength: number } | null {
+  const minRun = Math.max(5, Math.round(sw * 0.05));
+  const runs: { l: number; r: number; sum: number }[] = [];
+  let run = 0;
+  let runStart = 0;
+  let runSum = 0;
+  for (let x = 0; x <= sw; x++) {
+    const v = x < sw ? gray[y * sw + x] : 0;
+    if (x < sw && v >= thr) {
+      if (run === 0) {
+        runStart = x;
+        runSum = 0;
+      }
+      run++;
+      runSum += v;
+    } else if (run > 0) {
+      if (run >= minRun) runs.push({ l: runStart, r: runStart + run - 1, sum: runSum });
+      run = 0;
     }
   }
-  return out;
+  if (runs.length === 0) return null;
+
+  const cx = expectMid != null ? expectMid : sw * 0.5;
+  let best = runs[0];
+  let bestScore = -1e9;
+  for (const r of runs) {
+    const mid = (r.l + r.r) / 2;
+    const w = r.r - r.l + 1;
+    const dist = Math.abs(mid - cx);
+    // 下方列較寬：偏好寬＋近中；上方列偏好跟住 expectMid
+    const score =
+      w * 1.1 - dist * (expectMid != null ? 2.2 : 1.0) + (r.sum / w) * 0.05;
+    if (score > bestScore) {
+      bestScore = score;
+      best = r;
+    }
+  }
+  return {
+    l: best.l,
+    r: best.r,
+    strength: best.sum / (best.r - best.l + 1) / Math.max(1, thr),
+  };
+}
+
+function findFoulY(
+  gray: Uint8ClampedArray,
+  sw: number,
+  sh: number,
+  widths: number[],
+  leftFit: { a: number; b: number },
+  rightFit: { a: number; b: number }
+): number {
+  let bestY = sh * 0.88;
+  let bestScore = -1;
+  const y0 = Math.floor(sh * 0.7);
+  const y1 = Math.floor(sh * 0.94);
+  for (let y = y0; y <= y1; y++) {
+    const l = Math.max(0, Math.floor(leftFit.a + leftFit.b * y));
+    const r = Math.min(sw - 1, Math.ceil(rightFit.a + rightFit.b * y));
+    if (r - l < sw * 0.1) continue;
+    let edge = 0;
+    let n = 0;
+    if (y > 0) {
+      for (let x = l; x <= r; x += 2) {
+        edge += Math.abs(gray[y * sw + x] - gray[(y - 1) * sw + x]);
+        n++;
+      }
+    }
+    const avgEdge = n > 0 ? edge / n : 0;
+    const w = widths[y] || r - l;
+    const score = avgEdge * 1.1 + w * 0.04 + (y / sh) * 10;
+    if (score > bestScore) {
+      bestScore = score;
+      bestY = y;
+    }
+  }
+  return bestY;
+}
+
+function findPinsY(
+  gray: Uint8ClampedArray,
+  sw: number,
+  sh: number,
+  lefts: (number | null)[],
+  rights: (number | null)[],
+  widths: number[],
+  yFoul: number
+): number {
+  let yPins = sh * 0.1;
+  const yMax = Math.min(Math.floor(sh * 0.32), Math.floor(yFoul * 0.42));
+  let streak = 0;
+  let firstStable = -1;
+  for (let y = Math.floor(sh * 0.04); y <= yMax; y++) {
+    if (lefts[y] != null && rights[y] != null && widths[y] >= sw * 0.07) {
+      streak++;
+      if (streak >= 3 && firstStable < 0) firstStable = y - 2;
+    } else {
+      streak = 0;
+    }
+  }
+  if (firstStable >= 0) {
+    yPins = Math.max(sh * 0.05, firstStable - sh * 0.015);
+  }
+
+  let pinGlowY = -1;
+  let glowBest = 0;
+  for (let y = Math.floor(sh * 0.03); y <= Math.floor(sh * 0.2); y++) {
+    let hi = 0;
+    for (let x = Math.floor(sw * 0.28); x < Math.floor(sw * 0.72); x++) {
+      if (gray[y * sw + x] > 200) hi++;
+    }
+    if (hi > glowBest) {
+      glowBest = hi;
+      pinGlowY = y;
+    }
+  }
+  if (pinGlowY >= 0 && glowBest > sw * 0.015) {
+    yPins = Math.min(yPins, Math.max(sh * 0.045, pinGlowY - sh * 0.015));
+  }
+  return yPins;
+}
+
+function fitLineRobust(
+  ys: number[],
+  xs: number[]
+): { a: number; b: number; inlierRatio: number } | null {
+  const first = fitLine(ys, xs);
+  if (!first) return null;
+  const res: number[] = [];
+  for (let i = 0; i < ys.length; i++) {
+    res.push(Math.abs(xs[i] - (first.a + first.b * ys[i])));
+  }
+  const sorted = [...res].sort((a, b) => a - b);
+  const med = sorted[Math.floor(sorted.length / 2)] || 1;
+  const thr = Math.max(2.5, med * 2.5);
+  const iy: number[] = [];
+  const ix: number[] = [];
+  for (let i = 0; i < ys.length; i++) {
+    if (res[i] <= thr) {
+      iy.push(ys[i]);
+      ix.push(xs[i]);
+    }
+  }
+  const inlierRatio = iy.length / ys.length;
+  if (iy.length < 6) return { ...first, inlierRatio };
+  const second = fitLine(iy, ix);
+  if (!second) return { ...first, inlierRatio };
+  return { ...second, inlierRatio };
 }
 
 function fitLine(
@@ -237,21 +520,19 @@ function fitLine(
   return { a, b };
 }
 
-/** 沿水平方向找亮度梯度最大處微調邊緣 */
 function nudgeEdge(
   gray: Uint8ClampedArray,
   sw: number,
   sh: number,
   p: Point2D,
   side: -1 | 1,
-  /** 外側偏好強度；pins 端宜細，避免 TL／TR 鎖進溝 */
   outwardBias = 0.15
 ): Point2D {
   const y = Math.max(1, Math.min(sh - 2, Math.round(p.y)));
   const x0 = Math.max(2, Math.min(sw - 3, Math.round(p.x)));
   let bestX = x0;
   let bestG = -1;
-  const span = Math.max(4, Math.round(sw * 0.04));
+  const span = Math.max(4, Math.round(sw * 0.045));
   for (let dx = -span; dx <= span; dx++) {
     const x = x0 + dx;
     if (x < 1 || x >= sw - 1) continue;
@@ -266,9 +547,89 @@ function nudgeEdge(
   return { x: bestX, y: p.y };
 }
 
+function edgeGradientScore(
+  gray: Uint8ClampedArray,
+  sw: number,
+  sh: number,
+  corners: LaneCorners,
+  scale: number
+): number {
+  const pts = [corners.tl, corners.bl, corners.tr, corners.br];
+  let sum = 0;
+  let n = 0;
+  for (const p of pts) {
+    const x = Math.round(p.x * scale);
+    const y = Math.round(p.y * scale);
+    if (x < 1 || x >= sw - 1 || y < 0 || y >= sh) continue;
+    sum += Math.abs(gray[y * sw + x + 1] - gray[y * sw + x - 1]);
+    n++;
+  }
+  if (n === 0) return 0.3;
+  return Math.max(0, Math.min(1, sum / n / 40));
+}
+
+function aspectSanityPenalty(
+  corners: LaneCorners,
+  width: number,
+  height: number
+): number {
+  const botW = Math.hypot(
+    corners.br.x - corners.bl.x,
+    corners.br.y - corners.bl.y
+  );
+  const topW = Math.hypot(
+    corners.tr.x - corners.tl.x,
+    corners.tr.y - corners.tl.y
+  );
+  const leftL = Math.hypot(
+    corners.tl.x - corners.bl.x,
+    corners.tl.y - corners.bl.y
+  );
+  const rightL = Math.hypot(
+    corners.tr.x - corners.br.x,
+    corners.tr.y - corners.br.y
+  );
+  if (botW < 1 || topW < 1) return 0.2;
+  const ratio = topW / botW;
+  let pen = 0;
+  if (ratio > 0.95 || ratio < 0.1) pen += 0.12;
+  const sideAsym = Math.abs(leftL - rightL) / Math.max(leftL, rightL);
+  if (sideAsym > 0.25) pen += 0.08;
+  const hImg =
+    (corners.bl.y + corners.br.y) / 2 - (corners.tl.y + corners.tr.y) / 2;
+  if (hImg < height * 0.45) pen += 0.1;
+  void LANE_ASPECT;
+  void width;
+  return pen;
+}
+
+function downscaleGray(
+  rgba: Uint8ClampedArray,
+  w: number,
+  h: number,
+  sw: number,
+  sh: number
+): Uint8ClampedArray {
+  const out = new Uint8ClampedArray(sw * sh);
+  for (let y = 0; y < sh; y++) {
+    const sy = Math.min(h - 1, Math.floor((y / sh) * h));
+    for (let x = 0; x < sw; x++) {
+      const sx = Math.min(w - 1, Math.floor((x / sw) * w));
+      const i = (sy * w + sx) * 4;
+      out[y * sw + x] =
+        (rgba[i] * 77 + rgba[i + 1] * 150 + rgba[i + 2] * 29) >> 8;
+    }
+  }
+  return out;
+}
+
 function clampPt(p: Point2D, w: number, h: number): Point2D {
   return {
     x: Math.max(0, Math.min(w - 1, p.x)),
     y: Math.max(0, Math.min(h - 1, p.y)),
   };
+}
+
+function clamp(v: number, lo: number, hi: number): number {
+  return Math.max(lo, Math.min(hi, v));
 }

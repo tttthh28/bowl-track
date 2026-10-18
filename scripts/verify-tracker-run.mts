@@ -225,6 +225,52 @@ assert(rpmEst.rpm == null || rpmEst.confidence >= 0.55, "rpm gate");
   );
 }
 
+// --- 球速：impact ≤ launch ---
+{
+  const pts = [];
+  for (let i = 0; i < 40; i++) {
+    pts.push({
+      image: { x: 200 + i * 1.5, y: 520 - i * 10 },
+      lane: { board: 16 + i * 0.05, feet: 2 + i * 1.4 },
+      t: i * 45,
+    });
+  }
+  const est = computeShotEstimate(pts as any);
+  if (est.launchSpeedMph != null && est.impactSpeedMph != null) {
+    assert(
+      est.impactSpeedMph <= est.launchSpeedMph + 0.05,
+      `impact≤launch (${est.impactSpeedMph}≤${est.launchSpeedMph})`
+    );
+  } else {
+    console.log(
+      "OK: impact/launch partial",
+      est.launchSpeedMph,
+      est.impactSpeedMph
+    );
+  }
+}
+
+// --- 去重：幾乎相同軌跡 ---
+{
+  const mk = (ox = 0) => {
+    const pts = [];
+    for (let i = 0; i < 30; i++) {
+      pts.push({
+        image: { x: 180 + ox + i * 2, y: 500 - i * 9 },
+        lane: { board: 15, feet: 3 + i * 1.2 },
+        t: i * 40,
+      });
+    }
+    return pts;
+  };
+  const a = mk(0);
+  const b = mk(2);
+  assert(
+    isDuplicateOfLastShot(b as any, a as any, Date.now() - 3000, Date.now()),
+    "near-identical paths deduped within loop window"
+  );
+}
+
 if (failed) {
   console.error(`\n${failed} failed`);
   process.exit(1);

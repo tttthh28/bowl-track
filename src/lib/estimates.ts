@@ -166,6 +166,28 @@ export function computeShotEstimate(
     if (cov.maxFeet < 40) extrapolated.impactSpeed = true;
   }
 
+  // 物理合理性：impact 不應高於 launch（透視壓縮常令後段虛高）
+  if (launchSpeedMph != null && impactSpeedMph != null) {
+    if (impactSpeedMph > launchSpeedMph) {
+      impactSpeedMph = Math.round(launchSpeedMph * 0.94 * 10) / 10;
+      extrapolated.impactSpeed = true;
+    } else if (impactSpeedMph > launchSpeedMph * 0.99) {
+      // 幾乎無衰減時略壓，避免顯示「越滾越快」
+      impactSpeedMph = Math.round(launchSpeedMph * 0.97 * 10) / 10;
+    }
+  }
+  // avg 夾在 launch～impact 之間更合理；若 avg 高過 launch 則以 launch 為上限參考
+  if (
+    avgSpeedMph != null &&
+    launchSpeedMph != null &&
+    avgSpeedMph > launchSpeedMph * 1.08
+  ) {
+    avgSpeedMph = Math.round(
+      (0.7 * launchSpeedMph + 0.3 * Math.min(avgSpeedMph, launchSpeedMph * 1.05)) *
+        10
+    ) / 10;
+  }
+
   let hookBoards: number | null = null;
   if (foulBoard != null && breakpointBoard != null) {
     hookBoards = Math.round((foulBoard - breakpointBoard) * 10) / 10;
