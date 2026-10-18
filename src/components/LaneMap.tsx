@@ -20,20 +20,31 @@ const COLORS = [
   "#fb7185",
 ];
 
+/**
+ * 球道 2D 圖：上方＝高 feet（pins≈60′）、下方＝低 feet（foul≈0′）。
+ * 軌跡與刻度必須共用同一 feet→Y 映射。
+ */
 export default function LaneMap({
   shots,
   livePath = [],
   width = 220,
   height = 360,
 }: Props) {
-  const pad = 16;
-  const innerW = width - pad * 2;
-  const innerH = height - pad * 2;
+  // 左側加寬，避免 feet 標籤（如 60′）被裁切
+  const padL = 28;
+  const padR = 12;
+  const padT = 16;
+  const padB = 16;
+  const innerW = width - padL - padR;
+  const innerH = height - padT - padB;
+
+  /** feet 0→底部、feet LANE_L→頂部（與「↑ pins · foul ↓」一致） */
+  const feetToY = (feet: number) =>
+    padT + ((LANE_L - feet) / LANE_L) * innerH;
 
   const toXY = (p: LanePoint) => ({
-    x: pad + (p.board / LANE_W) * innerW,
-    // foul (0′) 在下方、pins (60′) 在上方
-    y: pad + ((LANE_L - p.feet) / LANE_L) * innerH,
+    x: padL + (p.board / LANE_W) * innerW,
+    y: feetToY(p.feet),
   });
 
   const boardLines = useMemo(() => {
@@ -56,11 +67,11 @@ export default function LaneMap({
         viewBox={`0 0 ${width} ${height}`}
         className="mx-auto block w-full max-w-[240px]"
         role="img"
-        aria-label="球道 2D 路徑圖"
+        aria-label="球道 2D 路徑圖，上方 pins 約 60 呎，下方 foul 約 0 呎"
       >
         <rect
-          x={pad}
-          y={pad}
+          x={padL}
+          y={padT}
           width={innerW}
           height={innerH}
           rx={4}
@@ -70,36 +81,35 @@ export default function LaneMap({
         />
         {/* board 線 */}
         {boardLines.map((b) => {
-          const x = pad + (b / LANE_W) * innerW;
+          const x = padL + (b / LANE_W) * innerW;
           return (
             <line
               key={`b${b}`}
               x1={x}
-              y1={pad}
+              y1={padT}
               x2={x}
-              y2={pad + innerH}
+              y2={padT + innerH}
               stroke={b === 20 ? "#64748b" : "#334155"}
               strokeWidth={b === 20 ? 1.2 : 0.6}
             />
           );
         })}
-        {/* feet 標記 */}
+        {/* feet 標記：與 toXY／feetToY 同一映射（上高下低） */}
         {footMarks.map((f) => {
-          // foul(0) 在下、pins(60) 在上，與 toXY 一致
-          const y = pad + ((LANE_L - f) / LANE_L) * innerH;
+          const y = feetToY(f);
           return (
             <g key={`f${f}`}>
               <line
-                x1={pad}
+                x1={padL}
                 y1={y}
-                x2={pad + innerW}
+                x2={padL + innerW}
                 y2={y}
                 stroke="#334155"
                 strokeDasharray="3 3"
                 strokeWidth={0.8}
               />
               <text
-                x={pad - 2}
+                x={padL - 4}
                 y={y + 3}
                 textAnchor="end"
                 fontSize={9}
@@ -110,13 +120,13 @@ export default function LaneMap({
             </g>
           );
         })}
-        {/* 標籤 */}
-        <text x={pad} y={pad - 4} fontSize={9} fill="#94a3b8">
+        {/* board 標籤（頂部左右） */}
+        <text x={padL} y={padT - 4} fontSize={9} fill="#94a3b8">
           0
         </text>
         <text
-          x={pad + innerW}
-          y={pad - 4}
+          x={padL + innerW}
+          y={padT - 4}
           textAnchor="end"
           fontSize={9}
           fill="#94a3b8"
@@ -171,7 +181,7 @@ export default function LaneMap({
             fill="#f97316"
           />
         )}
-        {/* 球瓶示意 */}
+        {/* 球瓶示意（≈58–60′，應在圖上方） */}
         <g>
           {[0, 1, 2, 3].map((row) =>
             Array.from({ length: row + 1 }).map((_, i) => {

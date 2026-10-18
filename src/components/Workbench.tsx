@@ -663,6 +663,13 @@ export default function Workbench() {
   };
 
   const newSession = () => {
+    if (
+      !confirm(
+        "建立新球局？目前鏡頭／影片與投球紀錄會離開本局（舊局仍留在本機）。"
+      )
+    ) {
+      return;
+    }
     stopTracking();
     const s = createSession();
     saveSession(s);
@@ -713,6 +720,15 @@ export default function Workbench() {
           type="button"
           onClick={runAutoDetect}
           disabled={!videoReady || tracking || detecting}
+          title={
+            detecting
+              ? "正在偵測球道…"
+              : tracking
+                ? "追蹤中無法偵測，請先停止追蹤"
+                : !videoReady
+                  ? "請先開啟鏡頭或上傳影片"
+                  : "自動估測球道四角"
+          }
           className="rounded-lg bg-emerald-700 px-3 py-2 text-sm font-medium text-white hover:bg-emerald-600 disabled:cursor-not-allowed disabled:opacity-40"
         >
           {detecting ? "偵測中…" : "自動偵測球道"}
@@ -722,6 +738,13 @@ export default function Workbench() {
             type="button"
             onClick={startTracking}
             disabled={!videoReady || !corners}
+            title={
+              !videoReady
+                ? "請先開啟鏡頭或上傳影片"
+                : !corners
+                  ? "請先自動偵測或拖曳四角標定球道"
+                  : "開始追蹤球路"
+            }
             className="rounded-lg bg-orange-600 px-3 py-2 text-sm font-medium text-white hover:bg-orange-500 disabled:cursor-not-allowed disabled:opacity-40"
           >
             開始追蹤
@@ -738,7 +761,13 @@ export default function Workbench() {
         <button
           type="button"
           onClick={resetSession}
-          className="rounded-lg border border-slate-600 px-3 py-2 text-sm text-slate-300 hover:bg-slate-800"
+          disabled={!session || session.shots.length === 0}
+          title={
+            !session || session.shots.length === 0
+              ? "本局尚無投球紀錄可清除"
+              : "清除本局所有投球紀錄"
+          }
+          className="rounded-lg border border-slate-600 px-3 py-2 text-sm text-slate-300 hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-40"
         >
           清除投球
         </button>

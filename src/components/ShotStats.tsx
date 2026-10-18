@@ -95,7 +95,7 @@ export default function ShotStats({ liveEstimate, shots }: Props) {
           <StatRow
             label="RPM（實驗）"
             value={formatRpm(est.rpm, est.rpmConfidence)}
-            hint="需清晰球標；低信心勿当真"
+            hint="需清晰球標；低信心勿當真"
           />
           <StatRow label="軌跡點數" value={String(est.pointCount)} />
         </div>
