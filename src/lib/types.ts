@@ -115,4 +115,9 @@ export type TrackerSettings = {
   rpmEnabled: boolean;
   /** RPM：球表對比門檻（越高越嚴） */
   rpmMinContrast: number;
+  /**
+   * false＝影像左=0（預設／bowling-demo）；
+   * true＝PBA 右溝=0（board′=39−board），StrikeTrack GT。
+   */
+  boardFromRight: boolean;
 };

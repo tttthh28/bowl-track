@@ -39,7 +39,16 @@ function StatRow({
 
 export default function ShotStats({ liveEstimate, shots }: Props) {
   const last = shots[shots.length - 1];
-  const est = liveEstimate ?? last?.estimate ?? null;
+  // 已存一投後影片重播會短暫 liveEstimate=早期假鎖（Arr~24）；短 live 跨距時信已存 estimate
+  const liveSpan =
+    liveEstimate?.coverageFeetMin != null &&
+    liveEstimate?.coverageFeetMax != null
+      ? liveEstimate.coverageFeetMax - liveEstimate.coverageFeetMin
+      : 0;
+  const est =
+    shots.length > 0 && liveSpan < 12
+      ? last?.estimate ?? liveEstimate ?? null
+      : liveEstimate ?? last?.estimate ?? null;
   const ex = est?.extrapolated ?? {};
 
   return (

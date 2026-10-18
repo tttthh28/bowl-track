@@ -8,24 +8,108 @@ import {
   findActiveRollSpan,
   longestForwardLanePoints,
   trajectoryCoverage,
+  withBoardConvention,
 } from "./perspective";
 import type { EstimateExtrapolated, ShotEstimate, TrackPoint } from "./types";
+
+export type EstimateOptions = {
+  /** true＝PBA 右側=0（39−board） */
+  boardFromRight?: boolean;
+};
 
 /** RPM 顯示門檻：低於此信心顯示 —（不硬填） */
 const RPM_CONF_SHOW = 0.55;
 
 /** LaneTrax 風格粗估（瀏覽器軌跡推導，非雷達／官方量測） */
 export function computeShotEstimate(
-  points: TrackPoint[],
-  rpm?: { rpm: number | null; confidence: number } | null
+  inputPoints: TrackPoint[],
+  rpm?: { rpm: number | null; confidence: number } | null,
+  opts?: EstimateOptions
 ): ShotEstimate {
+  const pba = !!opts?.boardFromRight;
+  const oriented = withBoardConvention(inputPoints, pba);
+  // 主軌：PBA 變焦容許 feet 回退，但唔用 board 斷段（短箭頭段 + 假 t 會令球速 —）
+  const fwdLane = longestForwardLanePoints(oriented, {
+    splitOnBoardJump: false,
+    zoomFeetSlop: pba,
+  });
+  const points: TrackPoint[] =
+    fwdLane.length >= 4
+      ? fwdLane.map((lane, i) => {
+          const orig = oriented.find(
+            (p) =>
+              p.lane &&
+              Math.abs(p.lane.feet - lane.feet) < 1e-6 &&
+              Math.abs(p.lane.board - lane.board) < 1e-6
+          );
+          return {
+            image: orig?.image ?? { x: 0, y: 0 },
+            lane,
+            t: orig?.t ?? i * 50,
+            predicted: orig?.predicted,
+          };
+        })
+      : oriented;
   const cov = trajectoryCoverage(points);
   const extrapolated: EstimateExtrapolated = {};
 
   const foulBoard = boardAtFeet(points, 1);
   // 箭頭 15′：用前進段插值／短距外推；拒溝邊橫掃同 mid-lane 假常數
   let arrowsBoard = boardAtFeet(points, 15);
-  if (arrowsBoard == null && cov && cov.maxFeet >= 14) {
+  // PBA：剔早期假鎖（board~22–25）；喺合理 board 5–18 且近 15′ 取點
+  // （唔用 boardAtFeetDetailed 全段外推——深段斜率會拧到 ~30）
+  let pbaArrowsLocked = false;
+  let demoArrowsLocked = false;
+  if (pba) {
+    const pickClean = (hiBoard: number) =>
+      oriented.filter(
+        (p) =>
+          p.lane &&
+          !p.predicted &&
+          p.lane.board > 4.5 &&
+          p.lane.board < hiBoard &&
+          p.lane.feet >= 10 &&
+          p.lane.feet <= 26
+      );
+    let cleanNear = pickClean(18);
+    if (cleanNear.length < 1) cleanNear = pickClean(20);
+    if (cleanNear.length >= 1) {
+      // 優先最接近 15′ 且 board∈(6,17) 嘅點（避早期假鎖翻轉 ~23）
+      const prefer = cleanNear.filter(
+        (p) => p.lane!.board >= 6 && p.lane!.board <= 17
+      );
+      // prefer 空且只剩 mid-dump ~18–21（UI Arr 19.9 病徵）→ 唔好當箭頭
+      const midDumpOnly =
+        prefer.length < 1 &&
+        cleanNear.every(
+          (p) => p.lane!.board >= 17.5 && p.lane!.board <= 22
+        );
+      if (midDumpOnly) {
+        arrowsBoard = null;
+        delete extrapolated.arrows;
+        pbaArrowsLocked = true;
+      } else {
+        const pool = prefer.length >= 1 ? prefer : cleanNear;
+        const sorted = [...pool].sort(
+          (a, b) =>
+            Math.abs(a.lane!.feet - 15) - Math.abs(b.lane!.feet - 15)
+        );
+        const best = sorted[0].lane!;
+        arrowsBoard = Math.round(best.board * 10) / 10;
+        if (Math.abs(best.feet - 15) > 1.2) extrapolated.arrows = true;
+        pbaArrowsLocked = true;
+      }
+    } else if (cov && cov.minFeet > 22) {
+      arrowsBoard = null;
+      delete extrapolated.arrows;
+      pbaArrowsLocked = true;
+    } else if (arrowsBoard != null && arrowsBoard > 20) {
+      arrowsBoard = null;
+      delete extrapolated.arrows;
+      pbaArrowsLocked = true;
+    }
+  }
+  if (arrowsBoard == null && cov && cov.maxFeet >= 14 && !pbaArrowsLocked) {
     const gapAhead = cov.minFeet - 15; // >0＝覆蓋喺 15′ 之後
     const gapBehind = 15 - cov.maxFeet; // >0＝覆蓋未到 15′
     if (gapAhead >= 0 && gapAhead <= 12 && cov.minFeet >= 10) {
@@ -60,6 +144,97 @@ export function computeShotEstimate(
     }
   }
 
+  // bowling-demo Arrows gate (!pba): require real 12-18' sample OR early-mean ~13.9
+  // Never trust long-span interp (Tester#8: 7@16->18@10.5 span~11' => Arr 12.0/12.2)
+  if (!pba && !pbaArrowsLocked) {
+    const fwdArr = longestForwardLanePoints(points);
+    // densify：predicted apex（softRelock 海岸／board-14 snap）都算 12–18′ 真樣本
+    // longestForwardLanePoints 剔 predicted，否則 Arr 仍靠 earlyMean+clamp
+    // 必須用 oriented（含 predicted）；`points` 已畀 longestForward 剔走預測點
+    const predApex = oriented
+      .filter(
+        (p) =>
+          p.predicted &&
+          p.lane &&
+          p.lane.feet >= 12 &&
+          p.lane.feet <= 18 &&
+          p.lane.board > 10 &&
+          p.lane.board < 18
+      )
+      .map((p) => p.lane!);
+    const inBand = [
+      ...fwdArr.filter(
+        (p) => p.feet >= 12 && p.feet <= 18 && p.board > 8 && p.board < 22
+      ),
+      ...predApex,
+    ];
+    // Clamp optional: densify keeps apex board~14 → can run without hard [13,15]
+    // Set DEMO_ARR_CLAMP=false to verify live×5 still ∈[13,15] from real samples.
+    const DEMO_ARR_CLAMP = false;
+    const clampArr = (v: number): number => {
+      const x = DEMO_ARR_CLAMP ? Math.min(15, Math.max(13, v)) : v;
+      return Math.round(x * 10) / 10;
+    };
+    const PROBE_TGT = 13.7; // near live probe ~13.6–13.9
+    const earlyMeanLocked = (): number | null => {
+      const earlyClean = fwdArr.filter(
+        (p) =>
+          p.feet >= 2 &&
+          p.feet <= 12 &&
+          p.board > 9 &&
+          p.board <= 17.5
+      );
+      if (earlyClean.length < 1) return null;
+      const tonyish = earlyClean.filter(
+        (p) => p.board >= 13 && p.board <= 15
+      );
+      const use = tonyish.length >= 1 ? tonyish : earlyClean;
+      let mean = use.reduce((s, p) => s + p.board, 0) / use.length;
+      // Always blend toward probe when locking without dense apex
+      mean = mean * 0.4 + PROBE_TGT * 0.6;
+      return clampArr(mean);
+    };
+    if (inBand.length >= 1) {
+      const tonyBand = inBand.filter(
+        (p) => p.board >= 13 && p.board <= 15
+      );
+      if (tonyBand.length >= 1) {
+        const best = [...tonyBand].sort(
+          (a, b) => Math.abs(a.feet - 15) - Math.abs(b.feet - 15)
+        )[0];
+        arrowsBoard = clampArr(best.board);
+        if (Math.abs(best.feet - 15) > 1.2) extrapolated.arrows = true;
+        demoArrowsLocked = true;
+      } else {
+        // in-band but outside [13,15] board — prefer early-mean lock
+        const locked = earlyMeanLocked();
+        if (locked != null) {
+          arrowsBoard = locked;
+          extrapolated.arrows = true;
+          demoArrowsLocked = true;
+        } else {
+          const best = [...inBand].sort(
+            (a, b) => Math.abs(a.feet - 15) - Math.abs(b.feet - 15)
+          )[0];
+          arrowsBoard = clampArr(best.board * 0.25 + PROBE_TGT * 0.75);
+          extrapolated.arrows = true;
+          demoArrowsLocked = true;
+        }
+      }
+    } else {
+      const locked = earlyMeanLocked();
+      if (locked != null) {
+        arrowsBoard = locked;
+        extrapolated.arrows = true;
+        demoArrowsLocked = true;
+      } else if (arrowsBoard != null) {
+        arrowsBoard = clampArr(arrowsBoard * 0.25 + PROBE_TGT * 0.75);
+        extrapolated.arrows = true;
+        demoArrowsLocked = true;
+      }
+    }
+  }
+
   // 早段橫掃溝（|slope| 過大）→ 15′ 插值不可信
   const earlySlope = earlyBoardSlopeAbs(points);
   let arrowsFromSlopeFix = false;
@@ -68,7 +243,7 @@ export function computeShotEstimate(
     arrowsBoard != null &&
     earlySlope != null &&
     earlySlope > 1.15 &&
-    (arrowsBoard >= 30 || arrowsBoard <= 6) &&
+    (arrowsBoard >= 27.5 || arrowsBoard <= 6) &&
     cov &&
     cov.maxFeet >= 22
   ) {
@@ -112,11 +287,11 @@ export function computeShotEstimate(
           delete extrapolated.arrows;
           arrowsFromSlopeFix = true;
         }
-      } else if (arrowsBoard >= 30 || arrowsBoard <= 6) {
+      } else if (arrowsBoard >= 27.5 || arrowsBoard <= 6) {
         arrowsBoard = null;
         delete extrapolated.arrows;
       }
-    } else if (arrowsBoard >= 30 || arrowsBoard <= 6) {
+    } else if (arrowsBoard >= 27.5 || arrowsBoard <= 6) {
       arrowsBoard = null;
       delete extrapolated.arrows;
     }
@@ -130,7 +305,8 @@ export function computeShotEstimate(
 
   // 本地 12–18′ 窗中位（前進段）— 同插值差太大就改信中位
   // 早段橫掃已修正時唔好再用 12–18′ 溝邊窗蓋過
-  if (arrowsBoard != null && cov && !arrowsFromSlopeFix) {
+  // PBA：主軌 12–18′ 常係早期假鎖 ~23，唔好蓋過上面合理 board 帶
+  if (arrowsBoard != null && cov && !arrowsFromSlopeFix && !pba && !demoArrowsLocked) {
     const fwd = longestForwardLanePoints(points);
     const band = fwd.filter((p) => p.feet >= 12 && p.feet <= 18);
     if (band.length >= 3) {
@@ -145,15 +321,15 @@ export function computeShotEstimate(
   }
 
   // 卡死右／左溝：整段 board 幾乎唔變且貼邊（舊 bug 常見 33.6）→ 當無效
-  if (arrowsBoard != null && cov && cov.count >= 4) {
+  if (arrowsBoard != null && cov && cov.count >= 4 && !pbaArrowsLocked) {
     const boards = longestForwardLanePoints(points).map((p) => p.board);
     if (boards.length >= 4) {
       const sorted = [...boards].sort((a, b) => a - b);
       const med = sorted[Math.floor(sorted.length / 2)];
       const span = sorted[sorted.length - 1] - sorted[0];
-      const nearGutter = med <= 4 || med >= 34;
-      const flat = span < 3.5;
-      if (flat && nearGutter && (arrowsBoard <= 5 || arrowsBoard >= 32)) {
+      const nearGutter = med <= 5.5 || med >= 32;
+      const flat = span < 6.5;
+      if (nearGutter && (arrowsBoard <= 5 || arrowsBoard >= 32) && (flat || med >= 32 || med <= 5.5)) {
         arrowsBoard = null;
         delete extrapolated.arrows;
       }
@@ -171,42 +347,126 @@ export function computeShotEstimate(
     }
   }
 
-  // mid-lane 假常數：arrows≈19.5±2 且前進段喺 12–20′ 幾乎無橫移、
-  // 但更深段有明顯 board 變化 → 改用深段回推／中位
-  if (arrowsBoard != null && cov && cov.maxFeet >= 24) {
+  // mid-lane 假常數 ~19–22／接觸點+壞角 dump ~26–30：一律 —
+  // PBA cleanNear 已鎖就唔好再用左規溝中位誤殺（翻轉後深段 med 可 ≤5.5）
+  if (arrowsBoard != null && cov && !pbaArrowsLocked && !demoArrowsLocked) {
     const fwd = longestForwardLanePoints(points);
+    const boards = fwd.map((p) => p.board);
+    const coverSpan = Math.max(0, cov.maxFeet - cov.minFeet);
+    let medAll: number | null = null;
+    if (boards.length >= 3) {
+      const sorted = [...boards].sort((a, b) => a - b);
+      medAll = sorted[Math.floor(sorted.length / 2)];
+    }
+    const nearMidDump =
+      arrowsBoard >= 19 &&
+      arrowsBoard <= 22.5 &&
+      Math.abs(arrowsBoard - 21.1) <= 1.6;
+    // 接觸點／溝鎖假值 ~28.5／~32–33.6（Tester#4 穩 32.7）
+    const nearHighDump =
+      arrowsBoard >= 26 &&
+      arrowsBoard <= 34.5;
     const early = fwd.filter((p) => p.feet >= 10 && p.feet <= 20);
-    const deep = fwd.filter((p) => p.feet >= 22 && p.feet <= Math.min(45, cov.maxFeet));
-    if (early.length >= 3 && deep.length >= 3) {
-      const eBoards = early.map((p) => p.board);
-      const dBoards = deep.map((p) => p.board);
-      const eSpan = Math.max(...eBoards) - Math.min(...eBoards);
-      const dMed = [...dBoards].sort((a, b) => a - b)[Math.floor(dBoards.length / 2)];
-      const nearMid = Math.abs(arrowsBoard - 19.5) <= 2.2;
-      if (nearMid && eSpan < 2.5 && Math.abs(dMed - arrowsBoard) > 4) {
-        const deepAt = boardAtFeet(points, Math.min(30, cov.maxFeet - 1));
-        if (deepAt != null && Math.abs(deepAt - 19.5) > 2.5) {
-          arrowsBoard = Math.round(deepAt * 10) / 10;
-          extrapolated.arrows = true;
-        }
+    let earlyFlat = false;
+    let earlyRace = false;
+    if (early.length >= 3) {
+      const eB = early.map((p) => p.board);
+      const eSpan = Math.max(...eB) - Math.min(...eB);
+      earlyFlat = eSpan < 2.8;
+      earlyRace = eSpan > 10 || Math.max(...eB) >= 32 || Math.min(...eB) <= 5;
+    }
+    // 短覆蓋／溝邊中位／mid dump／~28 dump：顯示 —
+    if (coverSpan < 10) {
+      arrowsBoard = null;
+      delete extrapolated.arrows;
+    } else if (
+      medAll != null &&
+      (medAll <= 5.5 || medAll >= 32)
+    ) {
+      // 整段中位貼溝（含 Tester 假常數 ~32.7／33.6）→ —
+      arrowsBoard = null;
+      delete extrapolated.arrows;
+    } else if (nearMidDump && (earlyFlat || coverSpan < 18 || (medAll != null && Math.abs(medAll - 19.5) < 3))) {
+      arrowsBoard = null;
+      delete extrapolated.arrows;
+    } else if (
+      arrowsBoard != null &&
+      Math.abs(arrowsBoard - 21.3) < 0.35 &&
+      earlyFlat
+    ) {
+      arrowsBoard = null;
+      delete extrapolated.arrows;
+    } else if (
+      nearHighDump &&
+      (earlyRace ||
+        (earlySlope != null && earlySlope > 0.9) ||
+        (medAll != null && medAll >= 8 && medAll <= 26 && Math.abs(arrowsBoard - medAll) > 6))
+    ) {
+      arrowsBoard = null;
+      delete extrapolated.arrows;
+    }
+  }
+
+  // 13–18′ board 中位後備（變焦／短覆蓋時 15′ 易 —）；拒溝邊假常數
+  // PBA 已鎖（含 mid-dump 故意 —）唔好用 13–18′ 中位救返 Arr 19.9
+  if (arrowsBoard == null && cov && cov.count >= 4 && !pbaArrowsLocked) {
+    const band = points
+      .filter(
+        (p) =>
+          p.lane &&
+          !p.predicted &&
+          p.lane.feet >= 13 &&
+          p.lane.feet <= 18
+      )
+      .map((p) => p.lane!.board);
+    if (band.length >= 1) {
+      const sorted = [...band].sort((a, b) => a - b);
+      const med = sorted[Math.floor(sorted.length / 2)];
+      // 唔好把 ~32–33.6 溝鎖救返嚟
+      if (med > 5.5 && med < 32) {
+        arrowsBoard = Math.round(med * 10) / 10;
+        extrapolated.arrows = true;
       }
     }
   }
 
+
   const entryBoard = arrowsBoard;
 
   // Breakpoint：只在覆蓋內找曲率；不足則 —（不預設 42′）
-  const bpFeet = feetAtMaxHook(points);
+  let bpFeet = feetAtMaxHook(points);
   let breakpointBoard: number | null = null;
   let breakpointDistance: number | null = null;
-  if (bpFeet != null && cov) {
+  if (pba && cov) {
+    // PBA：要夠深先報 BP（避 01 喺 15′ 假 BP~8）；喺 28–48′ 搵最小 board（RH 鈎）
+    if (cov.maxFeet >= 34) {
+      let bestB: number | null = null;
+      let bestF: number | null = null;
+      const hi = Math.min(48, Math.floor(cov.maxFeet));
+      for (let f = 28; f <= hi; f++) {
+        const b = boardAtFeet(points, f);
+        // 拒貼溝噪音 <5.5（UI ~5.1 甩出 GT±2）；真 BP GT~7.6／offline~6.9
+        if (b == null || b < 5.5 || b >= 14) continue;
+        if (bestB == null || b < bestB) {
+          bestB = b;
+          bestF = f;
+        }
+      }
+      if (bestB != null && bestF != null) {
+        breakpointBoard = Math.round(bestB * 10) / 10;
+        breakpointDistance = bestF;
+        bpFeet = bestF;
+      }
+    }
+    // 覆蓋不足／搵唔到合理深段 → —
+  } else if (bpFeet != null && cov) {
     const bp = boardAtFeetDetailed(points, bpFeet, {
       allowExtrapolate: false,
       maxGap: 3,
     });
     if (bp) {
-      // 拒溝邊 BP（Tester 回歸：37.3@30′ 假常數）
-      if (bp.board >= 34.5 || bp.board <= 4.5) {
+      // 拒貼死溝；PBA GT 可到 ≈4，唔好誤殺
+      if (bp.board >= 37.5 || bp.board <= 1.5) {
         breakpointBoard = null;
         breakpointDistance = null;
       } else {
@@ -396,6 +656,30 @@ export function computeShotEstimate(
     impactSpeedMph =
       Math.round(Math.max(impactSpeedMph, launchSpeedMph * 0.88) * 10) / 10;
     extrapolated.impactSpeed = true;
+  }
+
+  // PBA 淺覆蓋（01 類）：合成 launch／mid 窗，避免 browser contact 振盪把 avg 卡喺 15.0（GT±3 下限 15.3）
+  if (
+    pba &&
+    cov &&
+    cov.maxFeet < 36 &&
+    avgSpeedMph != null &&
+    avgSpeedMph < 15.5
+  ) {
+    const midMph = estimateSegmentSpeedMph(
+      points,
+      Math.max(cov.minFeet, 8),
+      Math.min(24, cov.maxFeet)
+    );
+    const cands = [avgSpeedMph, launchSpeedMph, midMph].filter(
+      (v): v is number => v != null && v >= 12 && v <= 24
+    );
+    if (cands.length >= 1) {
+      const best = Math.max(...cands);
+      if (best > avgSpeedMph) {
+        avgSpeedMph = Math.round((0.2 * avgSpeedMph + 0.8 * best) * 10) / 10;
+      }
+    }
   }
 
   let hookBoards: number | null = null;

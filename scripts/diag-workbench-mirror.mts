@@ -1,26 +1,31 @@
 /**
- * Headless mirror of Workbench upload detect → geom rank → short probe → track → estimate
+ * Headless mirror of Workbench upload path:
+ * multi-seek (NO early-break) → geom rank → continuous-frame laneProbe → full track.
+ * Aligns with Workbench + verify:arrows (same laneProbe).
  */
 import { execSync } from "child_process";
 import { readFileSync, mkdirSync } from "fs";
 import {
   BallTrackerState,
   DEFAULT_TRACKER,
+  ballContactPoint,
   rgbaToGray,
   trackBallFrame,
   trackWorkSize,
   scaleLaneCorners,
-  shouldEndShot,
   getRpmEstimate,
 } from "../src/lib/tracker.ts";
 import {
   detectLaneCorners,
+  snapCornersToTrueGutter,
   scoreLaneGeometry,
   frameHasLaneSignal,
 } from "../src/lib/laneDetect.ts";
+import { detectLaneCornersCorra } from "../src/lib/laneDetectCorra.ts";
 import { buildHomography, imageToLane } from "../src/lib/perspective.ts";
 import { computeShotEstimate } from "../src/lib/estimates.ts";
 import { evaluateShotQuality } from "../src/lib/shotQuality.ts";
+import { pickBestCornersByProbe, scoreCornersByProbe } from "../src/lib/laneProbe.ts";
 import type { LaneCorners } from "../src/lib/types.ts";
 
 const VIDEO = "test-media/bowling-demo.mp4";
@@ -63,6 +68,7 @@ function downscale(rgba: Uint8ClampedArray, tw: number, th: number) {
   return out;
 }
 
+// Workbench upload tryTimes — no early-break (upload needs probe diversity)
 const tryTimes = Array.from(
   new Set(
     [
@@ -92,11 +98,25 @@ for (const tSeek of tryTimes) {
   const rgba = frameAt(fi);
   if (!frameHasLaneSignal(rgba, W, H)) continue;
   const next = detectLaneCorners(rgba, W, H);
-  if (!next) continue;
-  const sc = scoreLaneGeometry(next, W, H);
-  detCands.push({ det: next, geom: sc, t: tSeek });
+  if (next) {
+    const sc = scoreLaneGeometry(next, W, H);
+    detCands.push({ det: next, geom: sc, t: tSeek });
+  }
+  // Corra snap 易同亮段搶 topN 但 foulY 不同 → probe arr=—；只作低分候選
+  const corra = detectLaneCornersCorra(rgba, W, H);
+  if (corra && corra.confidence >= 0.55) {
+    const snapped = {
+      ...corra,
+      corners: snapCornersToTrueGutter(corra.corners, W, H),
+    };
+    detCands.push({
+      det: snapped,
+      geom: scoreLaneGeometry(snapped, W, H) - 25,
+      t: tSeek,
+    });
+  }
 }
-console.log("detCands", detCands.length);
+console.log("detCands", detCands.length, "(no early-break)");
 
 const ranked = detCands
   .map((c) => {
@@ -105,12 +125,19 @@ const ranked = detCands
     const midBot = (corners.bl.x + corners.br.x) / 2;
     const midFrac = Math.abs(midBot / W - 0.5);
     const widthOk =
-      botFrac >= 0.32 && botFrac <= 0.48
-        ? 28
-        : botFrac >= 0.28 && botFrac <= 0.52
-          ? 8
-          : -35;
-    const midOk = midFrac < 0.1 ? 22 : midFrac < 0.16 ? 6 : -30;
+      botFrac >= 0.5 && botFrac <= 0.54
+        ? 36
+        : botFrac >= 0.46 && botFrac < 0.5
+          ? 28
+          : botFrac >= 0.32 && botFrac <= 0.48
+            ? 20
+            : botFrac >= 0.28 && botFrac <= 0.55
+              ? 6
+              : -35;
+    const midRightPen =
+      midBot / W > 0.52 ? -18 : midBot / W > 0.5 ? -8 : 0;
+    const midOk =
+      (midFrac < 0.1 ? 22 : midFrac < 0.16 ? 6 : -30) + midRightPen;
     return { ...c, rank: c.geom + widthOk + midOk, botFrac, midBot };
   })
   .sort((a, b) => b.rank - a.rank);
@@ -122,120 +149,57 @@ for (const c of ranked.slice(0, 6)) {
   );
 }
 
-const probeTimes: number[] = [];
-for (let i = 0; i < 28; i++) {
-  probeTimes.push(Math.min(dur - 0.08, 0.15 + i * (Math.min(dur, 7.5) / 28)));
-}
-const topN = ranked.slice(0, Math.min(4, ranked.length));
-let best: (typeof ranked)[0] | null = ranked[0] ?? null;
-let bestProbe = -1e9;
-
-for (const c of topN) {
-  const corners = c.det.corners;
-  const Hm = buildHomography(corners);
-  if (!Hm) continue;
-  const { scale, tw, th } = trackWorkSize(W, H);
-  const workCorners = scaleLaneCorners(corners, scale);
-  const st = new BallTrackerState();
-  const settings = { ...DEFAULT_TRACKER, sensitivity: 26, minBlobPixels: 28 };
-  const boards: number[] = [];
-  const earlyBoards: number[] = [];
-  const lateBoards: number[] = [];
-  let maxFeet = 0,
-    minFeet = 99,
-    locks = 0;
-  for (const tP of probeTimes) {
-    const rgba = frameAt(fiAtTime(tP));
-    const work =
-      scale < 1 ? downscale(rgba, tw, th) : new Uint8ClampedArray(rgba);
-    const gray = rgbaToGray(
-      work,
-      scale < 1 ? tw : W,
-      scale < 1 ? th : H
-    );
-    const res = trackBallFrame(
-      st,
-      gray,
-      scale < 1 ? tw : W,
-      scale < 1 ? th : H,
-      settings,
-      scale < 1 ? workCorners : corners,
-      1000 / 15,
-      work
-    );
-    if (res.locked && res.smoothed) {
-      locks++;
-      const pos =
-        scale < 1
-          ? { x: res.smoothed.x / scale, y: res.smoothed.y / scale }
-          : res.smoothed;
-      const lane = imageToLane(Hm, pos);
-      if (lane.board >= 1.5 && lane.board <= 37.5) {
-        boards.push(lane.board);
-        if (lane.feet > maxFeet) maxFeet = lane.feet;
-        if (lane.feet < minFeet) minFeet = lane.feet;
-        if (lane.feet <= 18) earlyBoards.push(lane.board);
-        if (lane.feet >= 28) lateBoards.push(lane.board);
-      }
-    }
-  }
-  const med =
-    boards.length > 0
-      ? [...boards].sort((a, b) => a - b)[Math.floor(boards.length / 2)]
-      : null;
-  const botFrac = (corners.br.x - corners.bl.x) / W;
-  const medOk =
-    med != null && med >= 8 && med <= 30
-      ? 35
-      : med != null && med >= 5 && med <= 34
-        ? 12
-        : -45;
-  const coverOk = Math.min(45, Math.max(0, maxFeet - minFeet));
-  const earlyOk = minFeet <= 18 ? 25 : minFeet <= 24 ? 8 : -18;
-  const widePen = botFrac > 0.5 ? -25 : 0;
-  const midStickPen =
-    med != null && Math.abs(med - 19.5) < 2.2 && maxFeet - minFeet < 8
-      ? -20
-      : 0;
-  let gutterRacePen = 0;
-  if (earlyBoards.length >= 3) {
-    const eMax = Math.max(...earlyBoards);
-    const eMin = Math.min(...earlyBoards);
-    if (eMax >= 32 || eMin <= 4 || eMax - eMin > 14) gutterRacePen = -40;
-  }
-  let deepOk = 0;
-  if (lateBoards.length >= 2) {
-    const lMed = [...lateBoards].sort((a, b) => a - b)[
-      Math.floor(lateBoards.length / 2)
-    ];
-    if (lMed >= 8 && lMed <= 24) deepOk = 30;
-    else if (lMed >= 5 && lMed <= 30) deepOk = 10;
-  }
-  const probeScore =
-    c.rank +
-    medOk +
-    coverOk +
-    earlyOk +
-    widePen +
-    midStickPen +
-    gutterRacePen +
-    deepOk +
-    Math.min(18, locks * 0.12);
-  console.log(
-    `probe t=${c.t.toFixed(2)} med=${med?.toFixed(1) ?? "—"} ft=${minFeet.toFixed(1)}-${maxFeet.toFixed(1)} gutterPen=${gutterRacePen} deep=${deepOk} → ${probeScore.toFixed(1)}`
-  );
-  if (probeScore > bestProbe) {
-    bestProbe = probeScore;
-    best = c;
-  }
+// Continuous ~15fps buffer (same idea as Workbench probeN≈90)
+const probeFrames: { rgba: Uint8ClampedArray; width: number; height: number }[] =
+  [];
+const probeN = Math.min(90, Math.max(40, Math.floor(Math.min(dur, 6.5) * FPS)));
+const t0 = Math.min(0.35, Math.max(0.08, dur * 0.04));
+for (let i = 0; i < probeN; i++) {
+  const tP = Math.min(dur - 0.06, t0 + i / FPS);
+  probeFrames.push({ rgba: frameAt(fiAtTime(tP)), width: W, height: H });
 }
 
-console.log(
-  "\nCHOSEN Workbench probe:",
-  best
-    ? `t=${best.t.toFixed(2)} conf=${(best.det.confidence * 100).toFixed(0)}% probe=${bestProbe.toFixed(1)}`
-    : "none"
+const picked = pickBestCornersByProbe(
+  ranked.map((c) => ({ det: c.det, geomRank: c.rank })),
+  probeFrames,
+  10
 );
+if (!picked) {
+  console.error("laneProbe picked nothing");
+  process.exit(1);
+}
+console.log("laneProbe pick", {
+  score: picked.detail.score.toFixed(1),
+  med: picked.detail.med?.toFixed(1),
+  arr: picked.detail.arrows?.toFixed(1) ?? "—",
+  locks: picked.detail.locks,
+  ft: `${picked.detail.minFeet.toFixed(1)}–${picked.detail.maxFeet.toFixed(1)}`,
+  botFrac: (
+    (picked.det.corners.br.x - picked.det.corners.bl.x) /
+    W
+  ).toFixed(3),
+  midBot: (
+    (picked.det.corners.bl.x + picked.det.corners.br.x) /
+    2
+  ).toFixed(0),
+});
+
+// Contrast: early-break single cand (old bug)
+{
+  const first = detCands[0];
+  if (first) {
+    const d = scoreCornersByProbe(first.det.corners, probeFrames, {
+      geomRank: first.geom,
+    });
+    console.log("EARLY-BREAK-ONLY (bug path)", {
+      t: first.t.toFixed(2),
+      med: d.med?.toFixed(1),
+      arr: d.arrows?.toFixed(1) ?? "—",
+      locks: d.locks,
+      ft: `${d.minFeet.toFixed(1)}–${d.maxFeet.toFixed(1)}`,
+    });
+  }
+}
 
 function fullTrackWB(corners: LaneCorners, sens: number, label: string) {
   const Hm = buildHomography(corners)!;
@@ -278,7 +242,14 @@ function fullTrackWB(corners: LaneCorners, sens: number, label: string) {
         : res.smoothed
       : null;
     if (res.locked && pos && (res.raw != null || res.predicted)) {
-      const lane = imageToLane(Hm, pos);
+      const rFull =
+        res.radius != null && res.radius > 0
+          ? scale < 1
+            ? res.radius / scale
+            : res.radius
+          : null;
+      const contact = ballContactPoint(pos, rFull);
+      const lane = imageToLane(Hm, contact);
       let accept = true;
       if (
         !res.predicted &&
@@ -289,7 +260,7 @@ function fullTrackWB(corners: LaneCorners, sens: number, label: string) {
       }
       if (accept && (pts.length > 0 || !res.predicted)) {
         pts.push({
-          image: pos,
+          image: contact,
           lane,
           t: f * (1000 / FPS),
           predicted: res.predicted || undefined,
@@ -316,10 +287,7 @@ function fullTrackWB(corners: LaneCorners, sens: number, label: string) {
   return est;
 }
 
-if (best) {
-  fullTrackWB(best.det.corners, 28, "PROBE+DEFAULT sens28");
-  fullTrackWB(best.det.corners, 26, "PROBE+sens26");
-}
+fullTrackWB(picked.det.corners, 26, "PROBE+sens26 (UI path)");
 if (ranked[0]) {
-  fullTrackWB(ranked[0].det.corners, 28, "GEOM-ONLY sens28 (probe skipped)");
+  fullTrackWB(ranked[0].det.corners, 26, "GEOM-ONLY top1");
 }

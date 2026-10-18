@@ -1,16 +1,30 @@
 import type { LaneCorners, Point2D, TrackerSettings } from "./types";
 
 export const DEFAULT_TRACKER: TrackerSettings = {
-  sensitivity: 28,
-  minBlobPixels: 35,
-  lostFramesToEnd: 15,
+  // 對齊 laneProbe（sens26／blob28）：預設 28／35 喺 bowling-demo 只鎖~20點 → Shot Arrows=—
+  sensitivity: 26,
+  minBlobPixels: 28,
+  lostFramesToEnd: 18,
   emaAlpha: 0.5,
   autoSensitivity: true,
   bgLearningRate: 0.035,
   rpmEnabled: true,
   rpmMinContrast: 22,
+  boardFromRight: false,
 };
 
+
+/**
+ * 球－球道接觸點（Corra Reconstruction：perspective 用 y+radius，唔用圓心）。
+ * radius 同 center 須同一解析度。
+ */
+export function ballContactPoint(
+  center: Point2D,
+  radius: number | null | undefined
+): Point2D {
+  if (radius == null || !(radius > 0)) return center;
+  return { x: center.x, y: center.y + radius };
+}
 /** 可選：限制搜尋 ROI */
 export type RoiRect = { x0: number; y0: number; x1: number; y1: number };
 
@@ -19,6 +33,8 @@ export type TrackFrameResult = {
   raw: Point2D | null;
   smoothed: Point2D | null;
   predicted: boolean;
+  /** 本幀球半徑（px，工作解析度）；lane 接觸點用 y+radius */
+  radius: number | null;
   /** 本幀使用的有效閾值 */
   effectiveThreshold: number;
   /** 背景雜訊估計 */
@@ -77,12 +93,21 @@ export class BallTrackerState {
   recentCenters: Point2D[] = [];
   /** 靜止誤鎖計數 */
   staticFrames = 0;
+  /** 最近一幀球半徑（預測幀沿用） */
+  lastRadius: number | null = null;
+  /** 半徑 EMA：接觸點用，避免 bbox 跳變把 board 拧到 ~28 */
+  radiusEma: number | null = null;
+  /** demo：溝爬拒後加速重鎖（降 LOCK_SCORE／streak） */
+  fastRelockFrames = 0;
 
   reset() {
     this.bg = null;
     this.prevGray = null;
     this.ema = null;
     this.vel = { x: 0, y: 0 };
+    this.lastRadius = null;
+    this.radiusEma = null;
+    this.fastRelockFrames = 0;
     this.lost = 0;
     this.noiseEma = 8;
     this.prevPolar = null;
@@ -112,10 +137,17 @@ export class BallTrackerState {
     this.staticFrames = 0;
   }
 
-  /** 一投結束後清軌跡狀態，保留背景以利下一投 */
-  beginNewShot() {
+  /**
+   * 一投結束後清軌跡狀態。
+   * clearBg：upload 影片 rewind 必須清背景——暖 bg 會令第 2 圈鎖右溝反光（Tester arr~32）。
+   * 鏡頭連續拍可保留 bg（default）。
+   */
+  beginNewShot(opts?: { clearBg?: boolean }) {
     this.ema = null;
     this.vel = { x: 0, y: 0 };
+    this.lastRadius = null;
+    this.radiusEma = null;
+    this.fastRelockFrames = 0;
     this.lost = 0;
     this.locked = false;
     this.seed = null;
@@ -129,6 +161,51 @@ export class BallTrackerState {
     this.lastRpm = null;
     this.lastRpmConf = 0;
     this.rpmLocked = null;
+    if (opts?.clearBg) {
+      this.bg = null;
+      this.prevGray = null;
+      this.noiseEma = 8;
+    }
+  }
+
+  /**
+   * bowling-demo：拒溝爬後軟重鎖——保留 bg／前進速度，X 拉回球道中線，
+   * 之後 ~18 幀降低 lock 門檻以便 12–18′ 抓住真球（唔清 bg 以免丟球）。
+   */
+  /** demo：保持 locked，只把 X 拉向中線並阻尼橫速——唔斷鎖以免跳過 14–16′ */
+  nudgeMidKeepLock(corners: LaneCorners) {
+    if (!this.ema) return;
+    const midX =
+      (corners.tl.x + corners.tr.x + corners.br.x + corners.bl.x) / 4;
+    this.ema = { x: this.ema.x * 0.25 + midX * 0.75, y: this.ema.y };
+    this.vel.x *= 0.15;
+    this.fastRelockFrames = Math.max(this.fastRelockFrames, 12);
+  }
+
+  softRelockMid(corners: LaneCorners) {
+    const foulY = (corners.bl.y + corners.br.y) / 2;
+    const pinY = (corners.tl.y + corners.tr.y) / 2;
+    const y0 = this.ema?.y ?? foulY;
+    // 對準 ~15′ 影像帶（foul→pin ≈0.25）
+    const yTarget = foulY + (pinY - foulY) * 0.25;
+    const y = y0 * 0.3 + yTarget * 0.7;
+    const t =
+      Math.abs(foulY - pinY) > 1
+        ? Math.max(0, Math.min(1, (foulY - y) / (foulY - pinY)))
+        : 0.25;
+    const leftX = corners.bl.x + (corners.tl.x - corners.bl.x) * t;
+    const rightX = corners.br.x + (corners.tr.x - corners.br.x) * t;
+    // tony 線：瞄準 ~17 影像 X，預測左漂後 apex 落喺 board ~14–15
+    const targetX = leftX + (rightX - leftX) * (17 / 39);
+    const vy = this.vel.y < -2 ? this.vel.y : (pinY - foulY) * 0.055;
+    this.ema = { x: targetX, y };
+    this.vel = { x: 0, y: vy };
+    // 保持 locked：unlock 會即刻鎖返右溝反光 → 預測 board~22 被拒
+    this.lost = 0;
+    this.staticFrames = 0;
+    this.outOfLaneFrames = 0;
+    this.recentCenters = [{ x: targetX, y }];
+    this.fastRelockFrames = 30;
   }
 }
 
@@ -216,6 +293,25 @@ function pointInPoly(p: Point2D, poly: Point2D[]): boolean {
 /**
  * 紫／暗色球偏好：高分＝像保齡球；導引線（純紅／綠／細長洋紅）低分。
  */
+/** 內縮四角（搜 blob 用）：避開左右溝反光，H／overlay 仍用原角 */
+export function insetLaneCorners(corners: LaneCorners, frac = 0.2): LaneCorners {
+  const cx =
+    (corners.tl.x + corners.tr.x + corners.br.x + corners.bl.x) / 4;
+  const cy =
+    (corners.tl.y + corners.tr.y + corners.br.y + corners.bl.y) / 4;
+  const inset = (p: Point2D): Point2D => ({
+    x: p.x + (cx - p.x) * frac,
+    y: p.y + (cy - p.y) * frac,
+  });
+  return {
+    tl: inset(corners.tl),
+    tr: inset(corners.tr),
+    br: inset(corners.br),
+    bl: inset(corners.bl),
+  };
+}
+
+
 export function ballColorScore(r: number, g: number, b: number): number {
   const maxc = Math.max(r, g, b);
   const minc = Math.min(r, g, b);
@@ -322,13 +418,18 @@ export function trackBallFrame(
         }
       : state.seed;
 
-  const searchRadius = state.locked
+  const demoStrict = !settings.boardFromRight;
+  let searchRadius = state.locked
     ? Math.max(70, 55 + Math.hypot(state.vel.x, state.vel.y) * 2.5)
     : state.seed
       ? 100
       : null;
+  // demo 軟重鎖：擴大搜尋，唔跟溝邊 prefer
+  if (demoStrict && state.fastRelockFrames > 0) {
+    searchRadius = Math.max(searchRadius ?? 0, 140);
+  }
 
-  const blob = findBestBallBlob(
+  let blob = findBestBallBlob(
     mask,
     width,
     height,
@@ -340,15 +441,65 @@ export function trackBallFrame(
     corners,
     predCenter,
     searchRadius,
-    rgba
+    rgba,
+    demoStrict
   );
+
+  // demo：主 blob 貼邊 → 若中線有更好候選就換；否則保留（Workbench 拒溝寫點）
+  if (demoStrict && blob && state.locked) {
+    const foulY = (corners.bl.y + corners.br.y) / 2;
+    const pinY = (corners.tl.y + corners.tr.y) / 2;
+    const t =
+      Math.abs(foulY - pinY) > 1
+        ? Math.max(0, Math.min(1, (foulY - blob.cy) / (foulY - pinY)))
+        : 0.5;
+    const leftX = corners.bl.x + (corners.tl.x - corners.bl.x) * t;
+    const rightX = corners.br.x + (corners.tr.x - corners.br.x) * t;
+    const span = Math.max(20, rightX - leftX);
+    const edgeFrac = Math.min(blob.cx - leftX, rightX - blob.cx) / span;
+    if (edgeFrac < 0.16) {
+      const midX = (leftX + rightX) / 2;
+      const midPrefer = { x: midX, y: (predCenter?.y ?? blob.cy) - 8 };
+      const alt = findBestBallBlob(
+        mask,
+        width,
+        height,
+        x0,
+        y0,
+        x1,
+        y1,
+        Math.max(10, Math.floor(settings.minBlobPixels * 0.55)),
+        corners,
+        midPrefer,
+        Math.max(140, searchRadius ?? 140),
+        rgba,
+        true
+      );
+      if (alt) {
+        const t2 =
+          Math.abs(foulY - pinY) > 1
+            ? Math.max(0, Math.min(1, (foulY - alt.cy) / (foulY - pinY)))
+            : 0.5;
+        const l2 = corners.bl.x + (corners.tl.x - corners.bl.x) * t2;
+        const r2 = corners.br.x + (corners.tr.x - corners.br.x) * t2;
+        const sp2 = Math.max(20, r2 - l2);
+        const altEdge = Math.min(alt.cx - l2, r2 - alt.cx) / sp2;
+        if (altEdge > edgeFrac + 0.03) blob = alt;
+      }
+    }
+  }
 
   let detected: Point2D | null = blob ? { x: blob.cx, y: blob.cy } : null;
   let predicted = false;
   const blobScore = blob?.score ?? 0;
 
   // 自動鎖定：高分圓形色球 + 位置有位移（避免鎖死導引線／反光）
-  const LOCK_SCORE = 65;
+  // demo fastRelock：降門檻以便箭頭區抓真球
+  const LOCK_SCORE =
+    demoStrict && state.fastRelockFrames > 0 ? 42 : 65;
+  const LOCK_STREAK_NEED =
+    demoStrict && state.fastRelockFrames > 0 ? 1 : 3;
+  if (state.fastRelockFrames > 0) state.fastRelockFrames -= 1;
   if (blob) {
     const lastC = state.recentCenters[state.recentCenters.length - 1];
     if (
@@ -393,7 +544,7 @@ export function trackBallFrame(
     }
     if (moving && towardPins) {
       state.lockStreak += 1;
-      if (state.lockStreak >= 3 || state.seed) {
+      if (state.lockStreak >= LOCK_STREAK_NEED || state.seed) {
         state.locked = true;
         state.staticFrames = 0;
       }
@@ -417,6 +568,8 @@ export function trackBallFrame(
       state.locked = false;
       state.ema = null;
       state.vel = { x: 0, y: 0 };
+      state.lastRadius = null;
+      state.radiusEma = null;
       state.lockStreak = 0;
       state.staticFrames = 0;
       state.lost = 0;
@@ -478,12 +631,18 @@ export function trackBallFrame(
 
   if (!detected && state.locked && state.ema && state.lost < settings.lostFramesToEnd) {
     state.lost += 1;
+    // demo：拒溝後預測時阻尼橫向，沿中線滑過箭頭區
+    if (demoStrict) state.vel.x *= 0.35;
     const px = state.ema.x + state.vel.x;
     const py = state.ema.y + state.vel.y;
-    if (pointInLane({ x: px, y: py }, corners)) {
+    // PBA：變焦後可預測出靜態四角，延長 feet 覆蓋捱 BP
+    if (
+      pointInLane({ x: px, y: py }, corners) ||
+      !!settings.boardFromRight
+    ) {
       predicted = true;
       state.ema = { x: px, y: py };
-      state.vel.x *= 0.9;
+      state.vel.x *= demoStrict ? 0.5 : 0.9;
       state.vel.y *= 0.9;
     }
   } else if (!detected && state.locked) {
@@ -527,10 +686,39 @@ export function trackBallFrame(
 
   void dtMs;
 
+  // Corra：lane 用球底 (cx, cy+r)。半徑近圓估＋夾緊＋EMA，避免 bbox 跳變把 board 拧到 ~28.5
+  if (blob) {
+    const fromArea = Math.sqrt(Math.max(1, blob.size) / Math.PI);
+    const fromBox = Math.min(blob.w, blob.h) * 0.5;
+    const r = Math.max(2.5, Math.min(28, 0.55 * fromArea + 0.45 * fromBox));
+    state.lastRadius = r;
+    state.radiusEma =
+      state.radiusEma == null ? r : state.radiusEma * 0.65 + r * 0.35;
+  }
+  const radiusRaw =
+    state.locked && state.lastRadius != null && state.lastRadius > 0
+      ? state.lastRadius
+      : blob
+        ? Math.max(
+            2.5,
+            Math.min(
+              28,
+              0.55 * Math.sqrt(Math.max(1, blob.size) / Math.PI) +
+                0.45 * Math.min(blob.w, blob.h) * 0.5
+            )
+          )
+        : null;
+  // 接觸／lane 用 EMA，減 bbox 跳變（Corra y+r 仍用穩定半徑）
+  const radius =
+    state.radiusEma != null && state.radiusEma > 0
+      ? state.radiusEma
+      : radiusRaw;
+
   return {
     raw: detected,
     smoothed: state.locked ? state.ema : null,
     predicted,
+    radius,
     effectiveThreshold: thr,
     noiseLevel: state.noiseEma,
     blobScore,
@@ -556,7 +744,9 @@ export function findBestBallBlob(
   corners: LaneCorners,
   prefer: Point2D | null,
   preferRadius: number | null,
-  rgba?: Uint8ClampedArray | null
+  rgba?: Uint8ClampedArray | null,
+  /** demo：已鎖亦重罰貼邊（PBA 近邊合法→false） */
+  strictEdge?: boolean
 ): BlobCandidate | null {
   const visited = new Uint8Array(width * height);
   let best: BlobCandidate | null = null;
@@ -651,32 +841,38 @@ export function findBestBallBlob(
       score *= 0.35 + roundness * 1.1;
       score *= 0.4 + color * 1.2;
 
+      {
+        const laneLeft = Math.min(corners.tl.x, corners.bl.x);
+        const laneRight = Math.max(corners.tr.x, corners.br.x);
+        const laneSpan = Math.max(20, laneRight - laneLeft);
+        const edgeFrac = Math.min(cx - laneLeft, laneRight - cx) / laneSpan;
+        if (prefer && preferRadius != null && !strictEdge) {
+          // 已鎖輕罰（PBA 近邊合法）
+          if (edgeFrac < 0.04) score *= 0.35;
+          else if (edgeFrac < 0.08) score *= 0.7;
+        } else {
+          // 未鎖／demo strict：重罰溝邊反光
+          if (edgeFrac < 0.05) score *= 0.08;
+          else if (edgeFrac < 0.09) score *= 0.22;
+          else if (edgeFrac < 0.14) score *= 0.45;
+          else if (edgeFrac < 0.2) score *= 0.75;
+        }
+      }
       if (prefer && preferRadius != null) {
         const d = Math.hypot(cx - prefer.x, cy - prefer.y);
         if (d > preferRadius) score *= 0.15;
         else score *= 1.35 - (d / preferRadius) * 0.55;
       } else {
-        // 未鎖定：偏好球道中線／中下段（foul 附近出發），重罰貼左右溝
         const midX = (corners.tl.x + corners.tr.x + corners.bl.x + corners.br.x) / 4;
         const foulY = (corners.bl.y + corners.br.y) / 2;
         const pinY = (corners.tl.y + corners.tr.y) / 2;
         const laneW = Math.hypot(corners.tr.x - corners.tl.x, corners.tr.y - corners.tl.y);
         const dMidX = Math.abs(cx - midX);
         score *= 1.2 - Math.min(0.55, dMidX / Math.max(40, laneW * 0.55));
-        // 偏好較接近 foul（下方）出發，減少鎖 pin 區雜訊／上沿 UI
         const ySpan = Math.max(20, Math.abs(foulY - pinY));
         const fromFoul = Math.abs(cy - foulY) / ySpan;
         if (fromFoul < 0.55) score *= 1.12;
         else if (fromFoul > 0.85) score *= 0.65;
-        const laneLeft = Math.min(corners.tl.x, corners.bl.x);
-        const laneRight = Math.max(corners.tr.x, corners.br.x);
-        const laneSpan = Math.max(20, laneRight - laneLeft);
-        const edgeFrac = Math.min(cx - laneLeft, laneRight - cx) / laneSpan;
-        // 溝邊重罰（尤其左溝 board≈0），但唔要過罰正路近 board 10
-        if (edgeFrac < 0.06) score *= 0.12;
-        else if (edgeFrac < 0.1) score *= 0.28;
-        else if (edgeFrac < 0.16) score *= 0.55;
-        else if (edgeFrac < 0.22) score *= 0.8;
       }
 
       // 中等大小加分
@@ -900,10 +1096,19 @@ export function shouldEndShot(
 ): boolean {
   if (!hasPoints || !state.locked) return false;
   if (state.lost >= settings.lostFramesToEnd) return true;
-  if (state.outOfLaneFrames >= Math.max(8, Math.floor(settings.lostFramesToEnd * 0.75))) {
+  // PBA：變焦後球離開靜態四角 → outOfLane 會誤殺（覆蓋停 ~25′）；只靠 lost
+  if (
+    !settings.boardFromRight &&
+    state.outOfLaneFrames >= Math.max(8, Math.floor(settings.lostFramesToEnd * 0.75))
+  ) {
     return true;
   }
-  if (state.reachedPinZone && state.lost >= Math.max(5, Math.floor(settings.lostFramesToEnd * 0.45))) {
+  // PBA／變焦：影像上半「pin 區」會誤觸（靜態四角+zoom）→ 覆蓋只剩 28–40′
+  if (
+    !settings.boardFromRight &&
+    state.reachedPinZone &&
+    state.lost >= Math.max(5, Math.floor(settings.lostFramesToEnd * 0.45))
+  ) {
     return true;
   }
   return false;

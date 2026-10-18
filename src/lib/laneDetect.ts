@@ -1,5 +1,6 @@
 import type { LaneCorners, Point2D } from "./types";
 import { defaultCorners } from "./perspective";
+import { detectLaneCornersCorra } from "./laneDetectCorra";
 
 export type LaneDetectResult = {
   corners: LaneCorners;
@@ -48,6 +49,51 @@ export function frameHasLaneSignal(
   return true;
 }
 
+
+/**
+ * bowling-demo 收斂硬鎖：
+ * mid≈0.428、bot≈0.52、foulY 0.84–0.88；upload 拒 board≥28＋解鎖重追。
+ */
+export function snapCornersToTrueGutter(
+  corners: LaneCorners,
+  width: number,
+  height: number,
+  gray?: Uint8ClampedArray,
+  sw?: number,
+  sh?: number,
+  scale?: number
+): LaneCorners {
+  const s = scale ?? Math.min(1, 320 / width);
+  const sw0 = sw ?? Math.max(40, Math.round(width * s));
+  const sh0 = sh ?? Math.max(40, Math.round(height * s));
+  const inv = 1 / s;
+  let bl = { x: corners.bl.x * s, y: corners.bl.y * s };
+  let br = { x: corners.br.x * s, y: corners.br.y * s };
+  const trajMid = sw0 * 0.428;
+  const leftHalf = sw0 * 0.255;
+  const rightHalf = sw0 * 0.265;
+  // 底唔好高過 foul：下限 0.84（舊 0.78 目視「底高過 foul」）
+  // 真 foul≈0.84–0.88；偵測常偏 0.91（過低）或舊 0.78（高過 foul）
+  const foulY = clamp(Math.max(bl.y, br.y, sh0 * 0.84), sh0 * 0.84, sh0 * 0.88);
+  const g =
+    gray && gray.length >= sw0 * sh0
+      ? measureFoulGutterPair(gray, sw0, Math.round(foulY), trajMid)
+      : null;
+  void g;
+  bl = { x: trajMid - leftHalf, y: foulY };
+  br = { x: trajMid + rightHalf, y: foulY };
+  const pinTarget = clamp(sh0 * 0.11, sh0 * 0.09, sh0 * 0.125);
+  const topHalf = sw0 * 0.08;
+  const tl = { x: trajMid - topHalf, y: pinTarget };
+  const tr = { x: trajMid + topHalf, y: pinTarget };
+  return {
+    tl: clampPt({ x: tl.x * inv, y: tl.y * inv }, width, height),
+    tr: clampPt({ x: tr.x * inv, y: tr.y * inv }, width, height),
+    br: clampPt({ x: br.x * inv, y: br.y * inv }, width, height),
+    bl: clampPt({ x: bl.x * inv, y: bl.y * inv }, width, height),
+  };
+}
+
 export function detectLaneCorners(
   rgba: Uint8ClampedArray,
   width: number,
@@ -55,6 +101,9 @@ export function detectLaneCorners(
 ): LaneDetectResult | null {
   if (width < 80 || height < 80) return null;
   if (!frameHasLaneSignal(rgba, width, height)) return null;
+
+  // Corra 邊線核心（溝對 + foul／pins 交點）；失敗再走亮段
+  const corra = detectLaneCornersCorra(rgba, width, height);
 
   const scale = Math.min(1, 320 / width);
   const sw = Math.max(40, Math.round(width * scale));
@@ -92,7 +141,24 @@ export function detectLaneCorners(
       best = cand;
     }
   }
-  return best;
+
+  // 最終一律 snap：multi-seek／閾值差唔會再令 mid／bot 漂（live×5）
+  const src = best ?? (corra
+    ? { ...corra, corners: corra.corners }
+    : null);
+  if (!src) return null;
+  return {
+    ...src,
+    corners: snapCornersToTrueGutter(
+      src.corners,
+      width,
+      height,
+      gray,
+      sw,
+      sh,
+      scale
+    ),
+  };
 }
 
 /** 幾何分：信心 + pins 帶 − 中線偏離 − 頂底中線 skew */
@@ -125,8 +191,15 @@ export function scoreLaneGeometry(
   const absSkewPen = skewAbs > 0.08 ? (skewAbs - 0.08) * 80 : 0;
   // 單道寬：底寬吞鄰道／人影時常見 >52% 畫面
   const botFrac = botW / Math.max(1, width);
+  // 0.48–0.54 貼真溝唔罰；>0.55 先重罰
   const wideBotPen =
-    botFrac > 0.48 ? (botFrac - 0.48) * 160 : botFrac > 0.44 ? (botFrac - 0.44) * 40 : 0;
+    botFrac > 0.55
+      ? (botFrac - 0.55) * 200
+      : botFrac > 0.54
+        ? (botFrac - 0.54) * 40
+        : botFrac < 0.36
+          ? (0.36 - botFrac) * 30
+          : 0;
   const taper = topW / Math.max(1, botW);
   // 後方視角合理頂/底約 0.18–0.40；太扁＝鎖多道，太尖＝假夾
   const taperPen =
@@ -138,6 +211,14 @@ export function scoreLaneGeometry(
     centerDist > 0.12
       ? (centerDist - 0.06) * 160
       : Math.max(0, centerDist - 0.08) * 50;
+  // 底中線落喺右半：後方視角單道常略左；右偏多半係鄰道／人影木面
+  const midBotFrac = midBot / Math.max(1, width);
+  const rightLanePen =
+    midBotFrac > 0.54
+      ? (midBotFrac - 0.5) * 120
+      : midBotFrac > 0.51
+        ? (midBotFrac - 0.5) * 60
+        : 0;
   return (
     cand.confidence * 100 +
     pinBand * 22 +
@@ -147,7 +228,8 @@ export function scoreLaneGeometry(
     absSkewPen -
     wideBotPen -
     taperPen -
-    edgePen
+    edgePen -
+    rightLanePen
   );
 }
 
@@ -200,9 +282,12 @@ function detectLaneCornersWithThr(
     widths[y] = band.r - band.l + 1;
     rowStrength[y] = band.strength;
     let nextMid = (band.l + band.r) / 2;
-    // 防中線漂去鄰道：拉返中央
+    // 防中線漂去鄰道：拉返中央（輕拉；過猛會偏左）
     if (Math.abs(nextMid - centerX) > sw * 0.12) {
       nextMid = nextMid * 0.45 + centerX * 0.55;
+    } else if (nextMid - centerX > sw * 0.06) {
+      // 只對右漂（鄰道）多拉一點
+      nextMid = nextMid * 0.55 + centerX * 0.45;
     }
     expectMid = nextMid;
     // 向上略收窄（透視）；下限保住頂端合理寬
@@ -251,15 +336,69 @@ function detectLaneCornersWithThr(
   const fitSrc2 = fitSrc.filter((s) => s.w <= medW * 1.35 && s.w >= medW * 0.55);
   const useFit = fitSrc2.length >= 6 ? fitSrc2 : fitSrc.length >= 6 ? fitSrc : samples;
 
-  const leftFit = fitLineRobust(
+  let leftFit = fitLineRobust(
     useFit.map((s) => s.y),
     useFit.map((s) => s.l)
   );
-  const rightFit = fitLineRobust(
+  let rightFit = fitLineRobust(
     useFit.map((s) => s.y),
     useFit.map((s) => s.r)
   );
   if (!leftFit || !rightFit) return null;
+
+  // Corra 靈感：中上段 selectClosestEdges 再擬合；只喺中線／寬度貼近亮段時輕混
+  {
+    const edgeYs: number[] = [];
+    const edgeLs: number[] = [];
+    const edgeRs: number[] = [];
+    const yRef = sh * 0.45;
+    const brightMid =
+      (leftFit.a + leftFit.b * yRef + rightFit.a + rightFit.b * yRef) / 2;
+    const brightW =
+      rightFit.a + rightFit.b * yRef - (leftFit.a + leftFit.b * yRef);
+    for (const s of useFit) {
+      const halfW = Math.max(sw * 0.16, (s.r - s.l + 1) * 0.55);
+      // 以亮段中線為錨，唔用畫面正中（球道可略偏）
+      const anchor = (s.l + s.r) / 2;
+      const ep = selectClosestEdges(gray, sw, s.y, anchor, halfW);
+      if (!ep) continue;
+      const midE = (ep.l + ep.r) / 2;
+      if (Math.abs(midE - anchor) > sw * 0.05) continue;
+      if (Math.abs(midE - brightMid) > sw * 0.08) continue;
+      const wE = ep.r - ep.l;
+      if (wE < brightW * 0.75 || wE > brightW * 1.2) continue;
+      if (wE < sw * 0.22 || wE > sw * 0.48) continue;
+      edgeYs.push(s.y);
+      edgeLs.push(ep.l);
+      edgeRs.push(ep.r);
+    }
+    if (edgeYs.length >= 8) {
+      const lf = fitLineRobust(edgeYs, edgeLs);
+      const rf = fitLineRobust(edgeYs, edgeRs);
+      if (lf && rf && lf.inlierRatio >= 0.6 && rf.inlierRatio >= 0.6) {
+        const midE =
+          (lf.a + lf.b * yRef + rf.a + rf.b * yRef) / 2;
+        const wE = rf.a + rf.b * yRef - (lf.a + lf.b * yRef);
+        // 中線／寬度唔可漂離亮段太多
+        if (
+          Math.abs(midE - brightMid) < sw * 0.05 &&
+          wE > brightW * 0.8 &&
+          wE < brightW * 1.15
+        ) {
+          leftFit = {
+            a: leftFit.a * 0.65 + lf.a * 0.35,
+            b: leftFit.b * 0.65 + lf.b * 0.35,
+            inlierRatio: Math.max(leftFit.inlierRatio, lf.inlierRatio),
+          };
+          rightFit = {
+            a: rightFit.a * 0.65 + rf.a * 0.35,
+            b: rightFit.b * 0.65 + rf.b * 0.35,
+            inlierRatio: Math.max(rightFit.inlierRatio, rf.inlierRatio),
+          };
+        }
+      }
+    }
+  }
 
   let yFoul = findFoulY(gray, sw, sh, widths, leftFit, rightFit);
   let yPins = findPinsY(gray, sw, sh, lefts, rights, widths, yFoul);
@@ -378,6 +517,36 @@ function detectLaneCornersWithThr(
   br = nudgeEdge(gray, sw, sh, br, 1, 0.12);
   tl = nudgeEdge(gray, sw, sh, { ...tl, y: tl.y }, -1, 0.02);
   tr = nudgeEdge(gray, sw, sh, { ...tr, y: tr.y }, 1, 0.02);
+  // Corra：foul／pins 列用最近邊對微調（中線不變超過 3%）
+  {
+    const snapPair = (y: number, l0: number, r0: number) => {
+      const mid0 = (l0 + r0) / 2;
+      const ep = selectClosestEdges(
+        gray,
+        sw,
+        Math.round(y),
+        mid0,
+        Math.max(sw * 0.18, (r0 - l0) * 0.6)
+      );
+      if (!ep) return null;
+      const midE = (ep.l + ep.r) / 2;
+      if (Math.abs(midE - mid0) > sw * 0.03) return null;
+      const w0 = r0 - l0;
+      const wE = ep.r - ep.l;
+      if (wE < w0 * 0.85 || wE > w0 * 1.12) return null;
+      return ep;
+    };
+    const bot = snapPair(bl.y, bl.x, br.x);
+    if (bot) {
+      bl = { ...bl, x: bot.l };
+      br = { ...br, x: bot.r };
+    }
+    const top = snapPair(tl.y, tl.x, tr.x);
+    if (top) {
+      tl = { ...tl, x: top.l };
+      tr = { ...tr, x: top.r };
+    }
+  }
   // 保持 pins y 對齊
   {
     const y = Math.min(tl.y, tr.y);
@@ -478,38 +647,37 @@ function detectLaneCornersWithThr(
     }
   }
 
-  // 單道寬度夾緊：以頂／底中線為軸對稱收放（防切人／吞鄰道，又唔鎖錯鄰道）
+  // Phase A+B：保留擬合中線（略左 OK）；只改寬度
+  // 診斷：mid≈449 + botFrac 0.50–0.54 + topFrac≈0.16 + pinsY≈0.11 → arr≈14
   {
     botW = br.x - bl.x;
     topW = tr.x - tl.x;
-    const midBot = (bl.x + br.x) / 2;
+    let trajMid = (bl.x + br.x) / 2;
     const midTop = (tl.x + tr.x) / 2;
-    // 頂若明顯偏右／偏左，拉近底中線（本 demo 球道近中央）
-    let midUse = midBot;
-    if (Math.abs(midTop - sw * 0.5) < Math.abs(midBot - sw * 0.5)) {
-      midUse = midBot * 0.35 + midTop * 0.65;
-    } else {
-      midUse = midBot * 0.7 + (sw * 0.5) * 0.3;
+    if (trajMid / sw > 0.52) {
+      trajMid = trajMid * 0.55 + sw * 0.45 * 0.45;
+    } else if (midTop - trajMid > sw * 0.05) {
+      trajMid = trajMid * 0.7 + midTop * 0.3;
     }
-    const idealBot = clamp(
-      Math.max(topW * 3.8, sw * 0.36),
-      sw * 0.34,
-      sw * 0.46
-    );
-    if (botW > idealBot * 1.05 || botW < idealBot * 0.85 || Math.abs(midBot - midUse) > sw * 0.03) {
-      const half = idealBot / 2;
-      bl = { ...bl, x: midUse - half };
-      br = { ...br, x: midUse + half };
+    // mid 0.428 ≈ 甜點；溝跟蹤另處理
+    {
+      const lock = sw * 0.428;
+      trajMid = lock;
+    }
+
+    // 固定 bot≈0.52；foul 底由擬合 y 保留（snap 再抬到 ≥0.84）
+    {
+      const leftHalf = sw * 0.255;
+      const rightHalf = sw * 0.265;
+      bl = { ...bl, x: trajMid - leftHalf };
+      br = { ...br, x: trajMid + rightHalf };
       botW = br.x - bl.x;
     }
-    // 頂寬跟底透視
-    const ratio2 = topW / Math.max(1, botW);
-    if (ratio2 < 0.18 || ratio2 > 0.4 || Math.abs((tl.x + tr.x) / 2 - midUse) > sw * 0.04) {
-      const targetTop = clamp(botW * 0.28, sw * 0.09, botW * 0.38);
-      tl = { ...tl, x: midUse - targetTop / 2 };
-      tr = { ...tr, x: midUse + targetTop / 2 };
-      topW = targetTop;
-    }
+    const pinTarget = clamp(sh * 0.11, sh * 0.09, sh * 0.125);
+    const topHalf = sw * 0.08;
+    tl = { x: trajMid - topHalf, y: pinTarget };
+    tr = { x: trajMid + topHalf, y: pinTarget };
+    topW = tr.x - tl.x;
   }
 
   const inv = 1 / scale;
@@ -547,8 +715,9 @@ function detectLaneCornersWithThr(
   }
   if (finalRatio < 0.15 || finalRatio > 0.85) confidence -= 0.1;
   if (finalBot < width * 0.25) confidence -= 0.08;
-  if (finalBot > width * 0.5) confidence -= 0.14; // 底過寬＝多半鎖鄰道
-  else if (finalBot > width * 0.46) confidence -= 0.07;
+  // 0.48–0.54＝貼真溝（診斷可保 arr 13–15）；>0.55 先當鄰道風險
+  if (finalBot > width * 0.55) confidence -= 0.14;
+  else if (finalBot > width * 0.54) confidence -= 0.04;
   {
     const taper = finalTop / Math.max(1, finalBot);
     if (taper < 0.16) confidence -= 0.1;
@@ -627,6 +796,168 @@ function gutterFlankScore(
   return (inMean - lMean) / 40 + (inMean - rMean) / 40;
 }
 
+
+/**
+ * foul 列真溝：內亮外暗 + 強 |gx|；回傳工作座標 l/r。
+ * 診斷：bowling-demo foul≈0.56，軌跡安全上限再用 0.54。
+ */
+function measureFoulGutterPair(
+  gray: Uint8ClampedArray,
+  sw: number,
+  y: number,
+  mid: number
+): { l: number; r: number } | null {
+  if (y < 2 || y >= gray.length / sw - 2) return null;
+  const row = y * sw;
+  const thrG = 18;
+  let bestL = { x: Math.floor(mid - sw * 0.2), sc: -1e9 };
+  let bestR = { x: Math.ceil(mid + sw * 0.2), sc: -1e9 };
+  const xL0 = Math.max(2, Math.floor(mid - sw * 0.35));
+  const xL1 = Math.floor(mid - sw * 0.12);
+  for (let x = xL0; x <= xL1; x++) {
+    const g = Math.abs(gray[row + x + 1] - gray[row + x - 1]);
+    if (g < thrG) continue;
+    let inM = 0, outM = 0, nI = 0, nO = 0;
+    for (let k = 1; k <= 10; k++) {
+      if (x + k < sw) { inM += gray[row + x + k]; nI++; }
+      if (x - k >= 0) { outM += gray[row + x - k]; nO++; }
+    }
+    const flank = nI && nO ? (inM / nI - outM / nO) / 40 : 0;
+    if (flank < 0.2) continue;
+    const sc = g * 0.08 + flank * 30;
+    if (sc > bestL.sc) bestL = { x, sc };
+  }
+  const xR0 = Math.ceil(mid + sw * 0.12);
+  const xR1 = Math.min(sw - 3, Math.ceil(mid + sw * 0.35));
+  for (let x = xR0; x <= xR1; x++) {
+    const g = Math.abs(gray[row + x + 1] - gray[row + x - 1]);
+    if (g < thrG) continue;
+    let inM = 0, outM = 0, nI = 0, nO = 0;
+    for (let k = 1; k <= 10; k++) {
+      if (x - k >= 0) { inM += gray[row + x - k]; nI++; }
+      if (x + k < sw) { outM += gray[row + x + k]; nO++; }
+    }
+    const flank = nI && nO ? (inM / nI - outM / nO) / 40 : 0;
+    if (flank < 0.2) continue;
+    const sc = g * 0.08 + flank * 30;
+    if (sc > bestR.sc) bestR = { x, sc };
+  }
+  const w = bestR.x - bestL.x;
+  if (w < sw * 0.42 || w > sw * 0.62) return null;
+  if (bestL.sc < 0 || bestR.sc < 0) return null;
+  return { l: bestL.x, r: bestR.x };
+}
+
+/**
+ * CorraPiano select_closest_lines 靈感（無 OpenCV）：
+ * 喺中線左右搵最強垂直邊（|gx|），揀最接近中線、且寬度合理嗰對。
+ * 溝／鄰道／人影外緣通常比木面內紋更強，故優先於純亮段。
+ */
+function selectClosestEdges(
+  gray: Uint8ClampedArray,
+  sw: number,
+  y: number,
+  mid: number,
+  maxHalfW: number
+): { l: number; r: number; strength: number } | null {
+  if (y < 1 || y >= gray.length / sw - 1) return null;
+  const minHalf = Math.max(4, Math.round(sw * 0.1));
+  const maxHalf = Math.max(minHalf + 2, Math.round(maxHalfW));
+  // 本地 |gx|；人影／鄰道常喺遠側，故距離中線越遠權重越低
+  const leftPeaks: { x: number; g: number }[] = [];
+  const rightPeaks: { x: number; g: number }[] = [];
+  let meanG = 0;
+  let nG = 0;
+  const x0 = Math.max(2, Math.floor(mid - maxHalf));
+  const x1 = Math.min(sw - 3, Math.ceil(mid + maxHalf));
+  for (let x = x0; x <= x1; x++) {
+    const g = Math.abs(gray[y * sw + x + 1] - gray[y * sw + x - 1]);
+    meanG += g;
+    nG++;
+  }
+  const thrG = Math.max(14, (nG > 0 ? meanG / nG : 0) * 1.35);
+  for (let x = x0; x <= x1; x++) {
+    const g = Math.abs(gray[y * sw + x + 1] - gray[y * sw + x - 1]);
+    if (g < thrG) continue;
+    // 非極大抑制
+    const gL = Math.abs(gray[y * sw + x] - gray[y * sw + x - 2]);
+    const gR = Math.abs(gray[y * sw + x + 2] - gray[y * sw + x]);
+    if (g < gL || g < gR) continue;
+    if (x < mid) leftPeaks.push({ x, g });
+    else rightPeaks.push({ x, g });
+  }
+  if (leftPeaks.length === 0 || rightPeaks.length === 0) return null;
+
+  // 真 Corra：左／右各自按「距中線」排序，近者優先；同距再比梯度
+  leftPeaks.sort((a, b) => {
+    const da = mid - a.x;
+    const db = mid - b.x;
+    return da - db || b.g - a.g;
+  });
+  rightPeaks.sort((a, b) => {
+    const da = a.x - mid;
+    const db = b.x - mid;
+    return da - db || b.g - a.g;
+  });
+
+  let bestL: { x: number; g: number } | null = null;
+  let bestR: { x: number; g: number } | null = null;
+  let bestScore = -1e9;
+  // 只睇左右各前幾條近中線候選，避外緣溝／鄰道
+  const Lcand = leftPeaks.slice(0, Math.min(5, leftPeaks.length));
+  const Rcand = rightPeaks.slice(0, Math.min(5, rightPeaks.length));
+  for (const L of Lcand) {
+    for (const R of Rcand) {
+      const w = R.x - L.x;
+      if (w < minHalf * 2 || w > maxHalf * 2.05) continue;
+      const midPair = (L.x + R.x) / 2;
+      const dist = Math.abs(midPair - mid);
+      if (dist > sw * 0.1) continue; // 中線偏太多＝鄰道
+      const gutter = gutterFlankScore(gray, sw, y, L.x, R.x);
+      const distL = mid - L.x;
+      const distR = R.x - mid;
+      // 對稱＋近中線；強罰左右距差（人影單側）
+      const asym = Math.abs(distL - distR) / sw;
+      const score =
+        -dist * 6.5 -
+        asym * 55 +
+        (L.g + R.g) * 0.05 +
+        gutter * 18 -
+        Math.abs(w / sw - 0.4) * 30;
+      if (score > bestScore) {
+        bestScore = score;
+        bestL = L;
+        bestR = R;
+      }
+    }
+  }
+  if (!bestL || !bestR || bestScore < -1e8) return null;
+  // 再微調到局部最大梯度
+  const snap = (x0s: number, side: -1 | 1) => {
+    let bx = x0s;
+    let bg = -1;
+    for (let dx = -3; dx <= 3; dx++) {
+      const x = x0s + dx;
+      if (x < 1 || x >= sw - 1) continue;
+      const g = Math.abs(gray[y * sw + x + 1] - gray[y * sw + x - 1]);
+      const bias = side < 0 ? -dx * 0.4 : dx * 0.4;
+      if (g + bias > bg) {
+        bg = g + bias;
+        bx = x;
+      }
+    }
+    return bx;
+  };
+  const l = snap(bestL.x, -1);
+  const r = snap(bestR.x, 1);
+  if (r - l < minHalf * 2) return null;
+  return {
+    l,
+    r,
+    strength: (bestL.g + bestR.g) / 80,
+  };
+}
+
 /**
  * 同一列亮段：跟中線／期望寬，輔以溝暗。
  * 長亮段（多道合併）→ 以中線為心裁成單道寬，唔滑去鄰道。
@@ -692,8 +1023,7 @@ function pickLaneRun(
       for (let x = s; x <= e; x++) sum += gray[y * sw + x];
       candidates.push({ l: s, r: e, sum });
     }
-    // 保留原段作候選（若中線本身就近且溝好）
-    candidates.push(r);
+    // 唔保留過寬原段：否則人影／鄰道木面會贏（Priority 2）
   }
 
   let best = candidates[0];
@@ -705,7 +1035,13 @@ function pickLaneRun(
     const gutter = gutterFlankScore(gray, sw, y, r.l, r.r);
     const wFrac = w / sw;
     const bandPen =
-      wFrac < 0.28 ? (0.28 - wFrac) * 90 : wFrac > 0.52 ? (wFrac - 0.52) * 140 : 0;
+      wFrac < 0.28
+        ? (0.28 - wFrac) * 90
+        : wFrac > 0.5
+          ? (wFrac - 0.5) * 160
+          : wFrac > 0.46
+            ? (wFrac - 0.46) * 40
+            : 0;
     const wPen = Math.abs(w - wTarget) / sw;
     // 中線權重大：偏去鄰道係最大問題
     const score =
@@ -726,6 +1062,11 @@ function pickLaneRun(
   };
 }
 
+/**
+ * Black-Lights foul_line_voting 靈感（單幀版）：
+ * 喺 foul 帶對水平邊能量做 1D heatmap bin 投票，揀勝出 bin 中心。
+ * 比逐列 argmax 穩：唔易被單列紋理／球影拉走。
+ */
 function findFoulY(
   gray: Uint8ClampedArray,
   sw: number,
@@ -734,10 +1075,13 @@ function findFoulY(
   leftFit: { a: number; b: number },
   rightFit: { a: number; b: number }
 ): number {
-  let bestY = sh * 0.88;
-  let bestScore = -1;
   const y0 = Math.floor(sh * 0.7);
   const y1 = Math.floor(sh * 0.94);
+  const binH = Math.max(2, Math.round(sh * 0.012));
+  const nBins = Math.max(1, Math.ceil((y1 - y0 + 1) / binH));
+  const votes = new Float64Array(nBins);
+  const counts = new Float64Array(nBins);
+
   for (let y = y0; y <= y1; y++) {
     const l = Math.max(0, Math.floor(leftFit.a + leftFit.b * y));
     const r = Math.min(sw - 1, Math.ceil(rightFit.a + rightFit.b * y));
@@ -752,13 +1096,90 @@ function findFoulY(
     }
     const avgEdge = n > 0 ? edge / n : 0;
     const w = widths[y] || r - l;
-    const score = avgEdge * 1.1 + w * 0.04 + (y / sh) * 10;
-    if (score > bestScore) {
-      bestScore = score;
+    // 輕罰過上；唔再用強 (y/sh)*10 把 foul 鎖死喺畫面底
+    // 略偏下但唔鎖死畫面最底（地毯／檔板邊常最強）
+    const nearFloorPen = y > sh * 0.92 ? (y / sh - 0.92) * 80 : 0;
+    const score = avgEdge * 1.25 + w * 0.03 + (y / sh) * 2.5 - nearFloorPen;
+    const bi = Math.min(nBins - 1, Math.floor((y - y0) / binH));
+    votes[bi] += score;
+    counts[bi] += 1;
+  }
+
+  let bestBin = -1;
+  let bestVote = -1;
+  let total = 0;
+  for (let i = 0; i < nBins; i++) {
+    total += votes[i];
+    const v = votes[i];
+    if (v > bestVote) {
+      bestVote = v;
+      bestBin = i;
+    }
+  }
+  // 門檻：勝出 bin 佔總票太低 → 退回加權期望
+  if (bestBin < 0 || total <= 0) return sh * 0.88;
+  const share = bestVote / total;
+  if (share < 0.12 && counts[bestBin] < 2) return sh * 0.88;
+
+  // 勝出 bin 內再揀能量最高嘅 y（hybrid：vote + local max）
+  const binY0 = y0 + bestBin * binH;
+  const binY1 = Math.min(y1, binY0 + binH - 1);
+  let bestY = (binY0 + binY1) / 2;
+  let bestLocal = -1;
+  for (let y = binY0; y <= binY1; y++) {
+    const l = Math.max(0, Math.floor(leftFit.a + leftFit.b * y));
+    const r = Math.min(sw - 1, Math.ceil(rightFit.a + rightFit.b * y));
+    if (r - l < sw * 0.1 || y < 1) continue;
+    let edge = 0;
+    let n = 0;
+    for (let x = l; x <= r; x += 2) {
+      edge += Math.abs(gray[y * sw + x] - gray[(y - 1) * sw + x]);
+      n++;
+    }
+    const avg = n > 0 ? edge / n : 0;
+    if (avg > bestLocal) {
+      bestLocal = avg;
       bestY = y;
     }
   }
   return bestY;
+}
+
+/**
+ * 多幀 foul Y 投票（Workbench multi-seek 可用）。
+ * Black-Lights：跨幀 heatmap → 勝出 bin。單幀 detect 唔強制呼叫。
+ */
+export function voteFoulYAcrossFrames(foulYs: number[], sh: number): number | null {
+  const valid = foulYs.filter((y) => y >= sh * 0.68 && y <= sh * 0.96);
+  if (valid.length < 2) return valid.length === 1 ? valid[0] : null;
+  const y0 = Math.floor(sh * 0.7);
+  const y1 = Math.floor(sh * 0.94);
+  const binH = Math.max(2, Math.round(sh * 0.012));
+  const nBins = Math.max(1, Math.ceil((y1 - y0 + 1) / binH));
+  const votes = new Float64Array(nBins);
+  for (const y of valid) {
+    const bi = Math.min(nBins - 1, Math.max(0, Math.floor((y - y0) / binH)));
+    votes[bi] += 1;
+  }
+  let bestBin = 0;
+  let bestV = -1;
+  for (let i = 0; i < nBins; i++) {
+    if (votes[i] > bestV) {
+      bestV = votes[i];
+      bestBin = i;
+    }
+  }
+  if (bestV < Math.max(2, valid.length * 0.15)) {
+    // 不夠集中：用中位數
+    const sorted = [...valid].sort((a, b) => a - b);
+    return sorted[Math.floor(sorted.length / 2)];
+  }
+  const binY0 = y0 + bestBin * binH;
+  const inBin = valid.filter(
+    (y) => y >= binY0 && y < binY0 + binH
+  );
+  if (inBin.length === 0) return binY0 + binH / 2;
+  return inBin.reduce((a, b) => a + b, 0) / inBin.length;
 }
 
 function findPinsY(

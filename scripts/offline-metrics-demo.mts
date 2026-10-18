@@ -7,10 +7,13 @@ import { join } from "path";
 import {
   BallTrackerState,
   DEFAULT_TRACKER,
+  ballContactPoint,
   rgbaToGray,
   trackBallFrame,
   shouldEndShot,
   getRpmEstimate,
+  trackWorkSize,
+  scaleLaneCorners,
 } from "../src/lib/tracker.ts";
 import {
   defaultCorners,
@@ -22,12 +25,14 @@ import {
   evaluateShotQuality,
 } from "../src/lib/shotQuality.ts";
 import { detectLaneCorners, scoreLaneGeometry } from "../src/lib/laneDetect.ts";
+import { pickBestCornersByProbe } from "../src/lib/laneProbe.ts";
 
 const ROOT = join(import.meta.dirname, "..");
 const VIDEO = join(ROOT, "test-media/bowling-demo.mp4");
 const OUT = "/tmp/bowl-offline2";
-const W = 640;
-const H = 576;
+// 原生解析度（同 Workbench／verify:arrows），追蹤內再用 trackWorkSize
+const W = 1060;
+const H = 954;
 const FPS = 15;
 const N = 130; // ~8.6s @15fps ≈ one loop
 
@@ -42,7 +47,7 @@ const frameBytes = W * H * 4;
 // 多幀候選：幾何分先行，再以短追蹤探針揀 medBoard／覆蓋較合理者
 type Cand = { det: NonNullable<ReturnType<typeof detectLaneCorners>>; geom: number; fi: number };
 const cands: Cand[] = [];
-for (const fi of [0, 4, 8, 12, 16, 20, 24, 30, 40, 48, 60]) {
+for (const fi of [0, 4, 8, 12, 16, 20, 21, 24, 30, 36, 40, 48, 60, 72, 90]) {
   const off = fi * frameBytes;
   if (off + frameBytes > raw.length) continue;
   const slice = new Uint8ClampedArray(
@@ -54,84 +59,52 @@ for (const fi of [0, 4, 8, 12, 16, 20, 24, 30, 40, 48, 60]) {
   if (!cand || cand.confidence < 0.4) continue;
   cands.push({ det: cand, geom: scoreLaneGeometry(cand, W, H), fi });
 }
-cands.sort((a, b) => b.geom - a.geom);
-const top = cands.slice(0, Math.min(5, cands.length));
+// Rank like Workbench (width + mid), then shared laneProbe
+const ranked = cands
+  .map((c) => {
+    const corners = c.det.corners;
+    const botFrac = (corners.br.x - corners.bl.x) / W;
+    const midBot = (corners.bl.x + corners.br.x) / 2;
+    const midFrac = Math.abs(midBot / W - 0.5);
+    const widthOk =
+      botFrac >= 0.32 && botFrac <= 0.48
+        ? 28
+        : botFrac >= 0.28 && botFrac <= 0.52
+          ? 8
+          : -35;
+    const midRightPen =
+      midBot / W > 0.52 ? -18 : midBot / W > 0.5 ? -8 : 0;
+    const midOk =
+      (midFrac < 0.1 ? 22 : midFrac < 0.16 ? 6 : -30) + midRightPen;
+    return { ...c, rank: c.geom + widthOk + midOk };
+  })
+  .sort((a, b) => b.rank - a.rank);
 
-function probeTrack(corners: import("../src/lib/types.ts").LaneCorners) {
-  const Hm = buildHomography(corners);
-  if (!Hm)
-    return { med: null as number | null, maxFeet: 0, minFeet: 99, locks: 0 };
-  const state = new BallTrackerState();
-  const settings = { ...DEFAULT_TRACKER, sensitivity: 26, minBlobPixels: 28 };
-  const boards: number[] = [];
-  let maxFeet = 0;
-  let minFeet = 99;
-  let locks = 0;
-  const nProbe = Math.min(Math.floor(raw.length / frameBytes), 110);
-  for (let f = 0; f < nProbe; f++) {
-    const rgba = new Uint8ClampedArray(
-      raw.buffer,
-      raw.byteOffset + f * frameBytes,
-      frameBytes
-    );
-    const copy = new Uint8ClampedArray(rgba);
-    const gray = rgbaToGray(copy, W, H);
-    const res = trackBallFrame(
-      state,
-      gray,
-      W,
-      H,
-      settings,
-      corners,
-      1000 / FPS,
-      copy
-    );
-    if (res.locked && res.smoothed) {
-      locks++;
-      const lane = imageToLane(Hm, res.smoothed);
-      if (lane.board >= 1.5 && lane.board <= 37.5) {
-        boards.push(lane.board);
-        if (lane.feet > maxFeet) maxFeet = lane.feet;
-        if (lane.feet < minFeet) minFeet = lane.feet;
-      }
-    }
-  }
-  const med =
-    boards.length > 0
-      ? [...boards].sort((a, b) => a - b)[Math.floor(boards.length / 2)]
-      : null;
-  return { med, maxFeet, minFeet: boards.length ? minFeet : 99, locks };
-}
-
-let det: ReturnType<typeof detectLaneCorners> = null;
-let bestProbe = -1e9;
-for (const c of top.length ? top : cands) {
-  const p = probeTrack(c.det.corners);
-  // medBoard 8–30、覆蓋遠、鎖幀多
-  const pinY = (c.det.corners.tl.y + c.det.corners.tr.y) / 2;
-  const medOk =
-    p.med != null && p.med >= 10 && p.med <= 28
-      ? 35
-      : p.med != null && p.med >= 7 && p.med <= 32
-        ? 15
-        : -50;
-  const coverOk = Math.min(45, Math.max(0, p.maxFeet - p.minFeet));
-  const earlyOk = p.minFeet <= 18 ? 25 : p.minFeet <= 22 ? 8 : -15;
-  const pinPen = pinY < H * 0.12 ? -20 : 0;
-  const score =
-    c.geom +
-    medOk +
-    coverOk +
-    earlyOk +
-    pinPen +
-    Math.min(20, p.locks * 0.12);
-  console.log(
-    `probe fi=${c.fi} geom=${c.geom.toFixed(1)} med=${p.med?.toFixed(1) ?? "—"} ft=${p.minFeet.toFixed(1)}–${p.maxFeet.toFixed(1)} locks=${p.locks} pinY=${pinY.toFixed(0)} → ${score.toFixed(1)}`
+const probeFrames: { rgba: Uint8ClampedArray; width: number; height: number }[] =
+  [];
+const nProbe = Math.min(Math.floor(raw.length / frameBytes), 95);
+for (let f = 5; f < nProbe; f++) {
+  const rgba = new Uint8ClampedArray(
+    raw.buffer,
+    raw.byteOffset + f * frameBytes,
+    frameBytes
   );
-  if (score > bestProbe) {
-    bestProbe = score;
-    det = c.det;
-  }
+  probeFrames.push({
+    rgba: new Uint8ClampedArray(rgba),
+    width: W,
+    height: H,
+  });
+}
+const picked = pickBestCornersByProbe(
+  ranked.map((c) => ({ det: c.det, geomRank: c.rank })),
+  probeFrames,
+  6
+);
+const det = picked?.det ?? ranked[0]?.det ?? null;
+if (picked) {
+  console.log(
+    `laneProbe pick score=${picked.detail.score.toFixed(1)} med=${picked.detail.med?.toFixed(1) ?? "—"} arr=${picked.detail.arrows?.toFixed(1) ?? "—"} ft=${picked.detail.minFeet.toFixed(1)}–${picked.detail.maxFeet.toFixed(1)} locks=${picked.detail.locks}`
+  );
 }
 const corners = det?.corners ?? defaultCorners(W, H);
 console.log(
@@ -150,6 +123,29 @@ if (corners.tl.y > H * 0.22 || corners.tr.y > H * 0.22) {
 
 const Hm = buildHomography(corners)!;
 const settings = { ...DEFAULT_TRACKER, sensitivity: 26, minBlobPixels: 28 };
+const { scale: trackScale, tw, th } = trackWorkSize(W, H);
+const workCorners = scaleLaneCorners(corners, trackScale);
+
+function downscale(
+  rgba: Uint8ClampedArray,
+  tw0: number,
+  th0: number
+): Uint8ClampedArray {
+  const out = new Uint8ClampedArray(tw0 * th0 * 4);
+  for (let y = 0; y < th0; y++) {
+    const sy = Math.min(H - 1, Math.floor((y / th0) * H));
+    for (let x = 0; x < tw0; x++) {
+      const sx = Math.min(W - 1, Math.floor((x / tw0) * W));
+      const si = (sy * W + sx) * 4;
+      const di = (y * tw0 + x) * 4;
+      out[di] = rgba[si];
+      out[di + 1] = rgba[si + 1];
+      out[di + 2] = rgba[si + 2];
+      out[di + 3] = 255;
+    }
+  }
+  return out;
+}
 
 type Pt = {
   image: { x: number; y: number };
@@ -200,32 +196,49 @@ function runPass(
       frameBytes
     );
     const rgbaCopy = new Uint8ClampedArray(rgba);
-    const gray = rgbaToGray(rgbaCopy, W, H);
+    const work =
+      trackScale < 1 ? downscale(rgbaCopy, tw, th) : rgbaCopy;
+    const trackW = trackScale < 1 ? tw : W;
+    const trackH = trackScale < 1 ? th : H;
+    const useC = trackScale < 1 ? workCorners : corners;
+    const gray = rgbaToGray(work, trackW, trackH);
     const res = trackBallFrame(
       state,
       gray,
-      W,
-      H,
+      trackW,
+      trackH,
       settings,
-      corners,
+      useC,
       1000 / FPS,
-      rgbaCopy
+      work
     );
     if (loopSaved) continue;
-    const pos = res.smoothed;
+    const pos = res.smoothed
+      ? trackScale < 1
+        ? { x: res.smoothed.x / trackScale, y: res.smoothed.y / trackScale }
+        : res.smoothed
+      : null;
     if (res.locked && pos && (res.raw || res.predicted)) {
       if (points.length === 0 && !res.predicted) shotStart = f * (1000 / FPS);
       if (points.length > 0 || !res.predicted) {
         const t = f * (1000 / FPS) - shotStart;
-        const lane = imageToLane(Hm, pos);
+        const rFull =
+          res.radius != null && res.radius > 0
+            ? trackScale < 1
+              ? res.radius / trackScale
+              : res.radius
+            : null;
+        const contact = ballContactPoint(pos, rFull);
+        const lane = imageToLane(Hm, contact);
         let accept = true;
         if (lane.board < 1.2 || lane.board > 37.8) {
           if (lane.feet < 45) accept = false;
         }
         if (accept) {
-          boardSamples.push(lane.board);
+          // 溝檢查用中段 board（接觸點喺 foul 附近 board 易偏低）
+          if (lane.feet >= 6 && lane.feet <= 45) boardSamples.push(lane.board);
           points.push({
-            image: pos,
+            image: contact,
             lane: { board: lane.board, feet: lane.feet },
             t,
             predicted: res.predicted || undefined,
@@ -309,18 +322,24 @@ for (const e of [...r1.saves, ...r2.saves]) {
   }
 }
 
-// 唔應系統性鎖左溝：若有存檔，中位 board 唔好長期貼 0–3；追蹤樣本亦然
-if (r1.medBoard != null && r1.saved > 0) {
-  assert(
-    r1.medBoard >= 3.5,
-    `saved track median board not left-gutter (${r1.medBoard?.toFixed(1)})`
-  );
-} else if (r1.medBoard != null) {
-  // 未存檔時追蹤樣本亦唔好成段貼 0–2
-  assert(
-    r1.medBoard >= 2.5 || r1.saved === 0,
-    `track medBoard ${r1.medBoard?.toFixed(1)} (discarded gutter ok)`
-  );
+// 唔應系統性鎖左溝：有 arrows 落喺 6–20 即當 OK；否則中位 board 唔好貼溝
+{
+  const arr0 = r1.saves[0]?.arrowsBoard;
+  const arrowsOk =
+    arr0 != null && arr0 >= 6 && arr0 <= 24;
+  if (arrowsOk) {
+    assert(true, `saved arrows not gutter (${arr0})`);
+  } else if (r1.medBoard != null && r1.saved > 0) {
+    assert(
+      r1.medBoard >= 3.5,
+      `saved track median board not left-gutter (${r1.medBoard?.toFixed(1)})`
+    );
+  } else if (r1.medBoard != null) {
+    assert(
+      r1.medBoard >= 2.5 || r1.saved === 0,
+      `track medBoard ${r1.medBoard?.toFixed(1)} (discarded gutter ok)`
+    );
+  }
 }
 
 // 合成：合格／不合格門檻

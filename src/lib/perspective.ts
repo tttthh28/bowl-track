@@ -134,7 +134,8 @@ export function trajectoryCoverage(
 
 /** 最長「大致往 pins 前進」段（feet 單調上升），剪掉回跳／誤鎖 */
 export function longestForwardLanePoints(
-  points: { lane?: LanePoint; predicted?: boolean }[]
+  points: { lane?: LanePoint; predicted?: boolean }[],
+  opts?: { splitOnBoardJump?: boolean; zoomFeetSlop?: boolean }
 ): LanePoint[] {
   const withLane = points
     .filter((p): p is { lane: LanePoint; predicted?: boolean } => !!p.lane && !p.predicted)
@@ -152,31 +153,79 @@ export function longestForwardLanePoints(
     return hi - lo;
   };
 
-  let best: LanePoint[] = [];
-  let bestSpan = -1;
+  const splitBoard = !!opts?.splitOnBoardJump;
+  const segments: LanePoint[][] = [];
   let cur: LanePoint[] = [withLane[0]];
+  // PBA／變焦：feet 可短暫回退（靜態四角+zoom）；board 橫跳仍緊（防早期假鎖併入箭頭）
+  const zoomSlop = !!opts?.zoomFeetSlop || splitBoard;
+  const feetBack = zoomSlop ? 10.0 : 0.8;
+  const boardJump = splitBoard ? 4.5 : 99;
   for (let i = 1; i < withLane.length; i++) {
     const prev = cur[cur.length - 1];
     const p = withLane[i];
-    // 允許小回跳（透視噪）；大回跳＝斷段
-    if (p.feet >= prev.feet - 0.8) {
+    const dBoard = Math.abs(p.board - prev.board);
+    // 預設只按 feet 斷段（保 bowling-demo）；PBA 另斷極端 board 橫跳
+    const cont =
+      p.feet >= prev.feet - feetBack && (!splitBoard || dBoard <= boardJump);
+    if (cont) {
       cur.push(p);
     } else {
-      const sp = spanOf(cur);
-      // 優先 feet 跨距（唔好揀瓶口怠速好多點但 span≈0）
-      if (sp > bestSpan || (Math.abs(sp - bestSpan) < 0.5 && cur.length > best.length)) {
-        best = cur;
-        bestSpan = sp;
-      }
+      if (cur.length >= 2) segments.push(cur);
       cur = [p];
     }
   }
-  const sp = spanOf(cur);
-  if (sp > bestSpan || (Math.abs(sp - bestSpan) < 0.5 && cur.length > best.length)) {
-    best = cur;
-    bestSpan = sp;
-  }
-  return best.length >= 2 && bestSpan >= 3 ? best : withLane;
+  if (cur.length >= 2) segments.push(cur);
+  if (segments.length === 0) return withLane;
+
+  const scoreSeg = (seg: LanePoint[]) => {
+    const sp = spanOf(seg);
+    if (!splitBoard) {
+      // PBA zoomSlop：唔好淨揀深段（丟 10–20′ 會令球速虛高／BP—）
+      // 獎勵覆蓋箭頭區 + 深度；bowling-demo（無 zoomSlop）仍用最大跨距
+      if (zoomSlop) {
+        const feet = seg.map((s) => s.feet);
+        const lo = Math.min(...feet);
+        const hi = Math.max(...feet);
+        let score = sp * 2 + seg.length * 0.1;
+        if (lo <= 16 && hi >= 14) score += 40;
+        else if (lo <= 20 && hi >= 12) score += 24;
+        if (lo <= 12) score += 22;
+        else if (lo <= 16) score += 10;
+        if (hi >= 40) score += 16;
+        if (hi >= 48) score += 8;
+        return score;
+      }
+      // 舊行為：最大跨距，其次長度
+      return sp * 1000 + seg.length;
+    }
+    const feet = seg.map((s) => s.feet);
+    const boards = seg.map((s) => s.board);
+    const lo = Math.min(...feet);
+    const hi = Math.max(...feet);
+    const sortedB = [...boards].sort((a, b) => a - b);
+    const medB = sortedB[Math.floor(sortedB.length / 2)];
+    let score = sp * 2 + seg.length * 0.08;
+    // 箭頭區優先（TesterManual／StrikeTrack 主項）；短 span 唔再 -20 誤殺
+    if (lo <= 16 && hi >= 14) score += 36;
+    else if (lo <= 18 && hi >= 12) score += 22;
+    else if (lo <= 22 && hi >= 10) score += 10;
+    if (hi >= 35) score += 14;
+    if (hi >= 45) score += 8;
+    // PBA 右溝=0 後：合法 Arrows／BP 多在 3–20；溝邊假段降分
+    if (medB >= 3 && medB <= 20) score += 12;
+    else if (medB < 2.5 || medB > 28) score -= 16;
+    // 只罰「又短又唔覆箭頭」嘅碎段
+    if (sp < 4 && !(lo <= 18 && hi >= 12)) score -= 20;
+    // 偏愛由 foul／arrows 起（唔好淨揀 mid-lane 變焦碎段）
+    if (lo <= 12) score += 8;
+    else if (lo <= 16) score += 4;
+    return score;
+  };
+  segments.sort((a, b) => scoreSeg(b) - scoreSeg(a));
+  const best = segments[0];
+  const bestSpan = spanOf(best);
+  const minSpan = splitBoard ? 1.2 : 3;
+  return best.length >= 2 && bestSpan >= minSpan ? best : withLane;
 }
 
 /**
@@ -196,6 +245,24 @@ export function earlyBoardSlopeAbs(
   const df = b.feet - a.feet;
   if (df < 2) return null;
   return Math.abs((b.board - a.board) / df);
+}
+
+
+/** PBA／StrikeTrack：board 由投手右側起计 */
+export function mirrorBoardFromRight(board: number): number {
+  return 39 - board;
+}
+
+/** 可選將 board 轉成「右=0」 */
+export function withBoardConvention<
+  T extends { lane?: { board: number; feet: number } }
+>(points: T[], boardFromRight: boolean): T[] {
+  if (!boardFromRight) return points;
+  return points.map((p) =>
+    p.lane
+      ? { ...p, lane: { feet: p.lane.feet, board: mirrorBoardFromRight(p.lane.board) } }
+      : p
+  );
 }
 
 export function boardAtFeetDetailed(
@@ -227,13 +294,16 @@ export function boardAtFeetDetailed(
   );
   if (!cov) return null;
 
-  // 區段內線性插值
+  // 區段內線性插值——拒跨大空洞（bowling-demo 常見 5′→40′ 插值令 Arrows 12.8↔15.6 甩）
+  // Arrows/sparse: span>6' interp yields Arr 12.0/12.2 (Tester#8)
+  const maxInterpSpan = Math.max(6, maxGap * 2);
   for (let i = 0; i < withLane.length - 1; i++) {
     const a = withLane[i].lane;
     const b = withLane[i + 1].lane;
     const lo = Math.min(a.feet, b.feet);
     const hi = Math.max(a.feet, b.feet);
     if (targetFeet >= lo && targetFeet <= hi && hi - lo > 1e-6) {
+      if (hi - lo > maxInterpSpan) continue; // 疏軌：交俾最近點／外推／上層 fallback
       const t = (targetFeet - a.feet) / (b.feet - a.feet);
       return {
         board: a.board + t * (b.board - a.board),

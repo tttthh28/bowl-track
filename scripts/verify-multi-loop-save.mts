@@ -14,8 +14,10 @@ import {
   getRpmEstimate,
   trackWorkSize,
   scaleLaneCorners,
+  ballContactPoint,
 } from "../src/lib/tracker.ts";
 import { detectLaneCorners, scoreLaneGeometry } from "../src/lib/laneDetect.ts";
+import { pickBestCornersByProbe } from "../src/lib/laneProbe.ts";
 import { defaultCorners, imageToLane, buildHomography } from "../src/lib/perspective.ts";
 import { computeShotEstimate } from "../src/lib/estimates.ts";
 import {
@@ -44,7 +46,7 @@ type DetCand = {
   fi: number;
 };
 const detCands: DetCand[] = [];
-for (const fi of [0, 8, 16, 24, 30, 40, 48, 60, 72]) {
+for (const fi of [0, 8, 12, 16, 21, 24, 30, 36, 40, 48, 60, 72, 90]) {
   const off = fi * frameBytes;
   if (off + frameBytes > raw.length) continue;
   const slice = new Uint8ClampedArray(raw.subarray(off, off + frameBytes));
@@ -52,104 +54,51 @@ for (const fi of [0, 8, 16, 24, 30, 40, 48, 60, 72]) {
   if (!cand || cand.confidence < 0.4) continue;
   detCands.push({ det: cand, geom: scoreLaneGeometry(cand, W, H), fi });
 }
-detCands.sort((a, b) => b.geom - a.geom);
-const topDet = detCands.slice(0, Math.min(10, detCands.length));
+const ranked = detCands
+  .map((c) => {
+    const corners = c.det.corners;
+    const botFrac = (corners.br.x - corners.bl.x) / W;
+    const midBot = (corners.bl.x + corners.br.x) / 2;
+    const midFrac = Math.abs(midBot / W - 0.5);
+    const widthOk =
+      botFrac >= 0.5 && botFrac <= 0.54
+        ? 28
+        : botFrac >= 0.46 && botFrac < 0.5
+          ? 12
+          : botFrac >= 0.32 && botFrac < 0.46
+            ? 4
+            : -20;
+    const midRightPen =
+      midBot / W > 0.52 ? -18 : midBot / W > 0.5 ? -8 : 0;
+    const midOk =
+      (midFrac < 0.1 ? 22 : midFrac < 0.16 ? 6 : -30) + midRightPen;
+    return { ...c, rank: c.geom + widthOk + midOk };
+  })
+  .sort((a, b) => b.rank - a.rank);
 
-function probeCorners(c: import("../src/lib/types.ts").LaneCorners) {
-  const Hm0 = buildHomography(c);
-  if (!Hm0) return { med: null as number | null, maxFeet: 0, minFeet: 99, locks: 0 };
-  const { scale: sc0, tw: tw0, th: th0 } = trackWorkSize(W, H);
-  const workC0 = scaleLaneCorners(c, sc0);
-  const st = new BallTrackerState();
-  const settings0 = { ...DEFAULT_TRACKER, sensitivity: 26, minBlobPixels: 28 };
-  const boards: number[] = [];
-  let maxFeet = 0;
-  let minFeet = 99;
-  let locks = 0;
-  const nProbe = Math.min(frames, 100);
-  for (let f = 0; f < nProbe; f++) {
-    const rgba = new Uint8ClampedArray(
+const probeFrames: { rgba: Uint8ClampedArray; width: number; height: number }[] =
+  [];
+for (let f = 5; f < Math.min(frames, 95); f++) {
+  probeFrames.push({
+    rgba: new Uint8ClampedArray(
       raw.buffer,
       raw.byteOffset + f * frameBytes,
       frameBytes
-    );
-    let workRgba: Uint8ClampedArray;
-    let ww = W, wh = H;
-    let useC = c;
-    if (sc0 < 1) {
-      workRgba = new Uint8ClampedArray(tw0 * th0 * 4);
-      for (let y = 0; y < th0; y++) {
-        const sy = Math.min(H - 1, Math.floor((y / th0) * H));
-        for (let x = 0; x < tw0; x++) {
-          const sx = Math.min(W - 1, Math.floor((x / tw0) * W));
-          const si = (sy * W + sx) * 4;
-          const di = (y * tw0 + x) * 4;
-          workRgba[di] = rgba[si];
-          workRgba[di + 1] = rgba[si + 1];
-          workRgba[di + 2] = rgba[si + 2];
-          workRgba[di + 3] = 255;
-        }
-      }
-      ww = tw0; wh = th0; useC = workC0;
-    } else {
-      workRgba = new Uint8ClampedArray(rgba);
-    }
-    const gray = rgbaToGray(workRgba, ww, wh);
-    const res = trackBallFrame(st, gray, ww, wh, settings0, useC, 1000 / FPS, workRgba);
-    if (res.locked && res.smoothed) {
-      locks++;
-      const pos =
-        sc0 < 1
-          ? { x: res.smoothed.x / sc0, y: res.smoothed.y / sc0 }
-          : res.smoothed;
-      const lane = imageToLane(Hm0, pos);
-      if (lane.board >= 1.5 && lane.board <= 37.5) {
-        boards.push(lane.board);
-        if (lane.feet > maxFeet) maxFeet = lane.feet;
-        if (lane.feet < minFeet) minFeet = lane.feet;
-      }
-    }
-  }
-  const med =
-    boards.length > 0
-      ? [...boards].sort((a, b) => a - b)[Math.floor(boards.length / 2)]
-      : null;
-  return { med, maxFeet, minFeet: boards.length ? minFeet : 99, locks };
+    ),
+    width: W,
+    height: H,
+  });
 }
-
-let det = null as ReturnType<typeof detectLaneCorners>;
-let bestScore = -1e9;
-for (const c of topDet.length ? topDet : detCands) {
-  const p = probeCorners(c.det.corners);
-  const botFrac = (c.det.corners.br.x - c.det.corners.bl.x) / W;
-  const midBot = (c.det.corners.bl.x + c.det.corners.br.x) / 2;
-  const midFrac = Math.abs(midBot / W - 0.5);
-  const medOk =
-    p.med != null && p.med >= 8 && p.med <= 30
-      ? 35
-      : p.med != null && p.med >= 5 && p.med <= 34
-        ? 12
-        : -45;
-  const coverOk = Math.min(45, Math.max(0, p.maxFeet - p.minFeet));
-  const earlyOk = p.minFeet <= 18 ? 25 : p.minFeet <= 24 ? 8 : -18;
-  const widthOk =
-    botFrac >= 0.32 && botFrac <= 0.48 ? 20 : botFrac > 0.52 ? -30 : 0;
-  const midOk = midFrac < 0.12 ? 15 : midFrac < 0.18 ? 4 : -20;
-  const score =
-    c.geom +
-    medOk +
-    coverOk +
-    earlyOk +
-    widthOk +
-    midOk +
-    Math.min(18, p.locks * 0.1);
+const picked = pickBestCornersByProbe(
+  ranked.map((c) => ({ det: c.det, geomRank: c.rank })),
+  probeFrames,
+  6
+);
+const det = picked?.det ?? ranked[0]?.det ?? null;
+if (picked) {
   console.log(
-    `probe fi=${c.fi} geom=${c.geom.toFixed(1)} med=${p.med?.toFixed(1) ?? "—"} ft=${p.minFeet.toFixed(1)}–${p.maxFeet.toFixed(1)} bot=${botFrac.toFixed(2)} → ${score.toFixed(1)}`
+    `laneProbe pick med=${picked.detail.med?.toFixed(1) ?? "—"} arr=${picked.detail.arrows?.toFixed(1) ?? "—"} ft=${picked.detail.minFeet.toFixed(1)}–${picked.detail.maxFeet.toFixed(1)} locks=${picked.detail.locks}`
   );
-  if (score > bestScore) {
-    bestScore = score;
-    det = c.det;
-  }
 }
 const corners = det?.corners ?? defaultCorners(W, H);
 console.log(
@@ -251,14 +200,21 @@ for (let loop = 0; loop < LOOPS; loop++) {
       if (points.length === 0 && !res.predicted) shotStart = f * (1000 / FPS);
       if (points.length > 0 || !res.predicted) {
         const t = f * (1000 / FPS) - shotStart;
-        const lane = imageToLane(Hm, pos);
+        const rFull =
+          res.radius != null && res.radius > 0
+            ? scale < 1
+              ? res.radius / scale
+              : res.radius
+            : null;
+        const contact = ballContactPoint(pos, rFull);
+        const lane = imageToLane(Hm, contact);
         let accept = true;
         if (lane.board < 1.2 || lane.board > 37.8) {
           if (lane.feet < 45) accept = false;
         }
         if (accept) {
           points.push({
-            image: pos,
+            image: contact,
             lane: { board: lane.board, feet: lane.feet },
             t,
             predicted: res.predicted || undefined,

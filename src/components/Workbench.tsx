@@ -20,12 +20,16 @@ import {
   fallbackDefaultCorners,
   frameHasLaneSignal,
   scoreLaneGeometry,
+  snapCornersToTrueGutter,
+  voteFoulYAcrossFrames,
 } from "@/lib/laneDetect";
 import { pickBestCornersByProbe } from "@/lib/laneProbe";
 import {
   BallTrackerState,
   DEFAULT_TRACKER,
+  ballContactPoint,
   getRpmEstimate,
+  insetLaneCorners,
   rgbaToGray,
   scaleLaneCorners,
   shouldEndShot,
@@ -85,6 +89,14 @@ export default function Workbench() {
   const settingsRef = useRef<TrackerSettings>({ ...DEFAULT_TRACKER });
   const sourceModeRef = useRef<SourceMode>("idle");
   const lastVideoTimeRef = useRef<number>(0);
+  /** upload：追蹤上限 ~15fps；同幀／過密 30fps 會鎖右溝 arr~32 */
+  const lastTrackedVtRef = useRef<number>(-1);
+  /** upload：連續拒溝後解鎖重追 */
+  const gutterRejectStreakRef = useRef(0);
+  /** PBA：本投是否見過左規 board≥24（真球箭頭區） */
+  const pbaSawHighBoardRef = useRef(false);
+  /** bowling-demo：inset 搜球避開溝邊；中段鎖穩後切回全角追 pocket */
+  const demoInsetActiveRef = useRef(true);
   const finishingRef = useRef(false);
   /** 存檔後冷卻，避免短投連存 */
   const shotCooldownUntilRef = useRef(0);
@@ -96,6 +108,13 @@ export default function Workbench() {
   const lastSavedShotRef = useRef<{
     points: TrackPoint[];
     createdAt: number;
+  } | null>(null);
+  /** LOCAL debug: last finishShot payload for UI-faithful dumps */
+  const lastDebugShotRef = useRef<{
+    estimate: ShotEstimate;
+    n: number;
+    boardsSample: string;
+    pba: boolean;
   } | null>(null);
   /** 本圈 loop 世代（回繞時 +1） */
   const loopGenRef = useRef(0);
@@ -329,15 +348,25 @@ export default function Workbench() {
         }
         attempts++;
         const next = detectLaneFromCanvas(canvas);
-        if (!next) continue;
-        const sc = scoreLaneGeometry(next, v.videoWidth, v.videoHeight);
-        detCands.push({ det: next, geom: sc });
-        if (sc > bestScore) {
-          bestScore = sc;
-          result = next;
+        if (next) {
+          const sc = scoreLaneGeometry(next, v.videoWidth, v.videoHeight);
+          detCands.push({ det: next, geom: sc });
+          if (sc > bestScore) {
+            bestScore = sc;
+            result = next;
+          }
         }
-        // 好幾何＋夠信心可提早停
-        if (sc >= 92 && next.confidence >= 0.65) break;
+        // Corra 唔再塞入 upload 候選（snap 後同亮段搶 topN → live arr=—／21）
+        // 單獨指標仍可由 detectLaneCornersCorra 腳本驗
+        // 上傳片要餵探針：唔好提早停，否則只剩首幀壞角（med~6.7 arr=— → UI arrows~21）
+        // 鏡頭即時仍可提早停
+        if (
+          !isUpload &&
+          next &&
+          next.confidence >= 0.65 &&
+          scoreLaneGeometry(next, v.videoWidth, v.videoHeight) >= 92
+        )
+          break;
       }
       // 多候選再排：單道寬＋中線近中央（避 geom 高但底邊吞鄰道／人 → arrows 卡 ~33.6）
       const vw = v.videoWidth || 1;
@@ -349,23 +378,40 @@ export default function Workbench() {
         const midBot = (corners.bl.x + corners.br.x) / 2;
         const midFrac = Math.abs(midBot / vw - 0.5);
         const widthOk =
-          botFrac >= 0.32 && botFrac <= 0.48
-            ? 28
-            : botFrac >= 0.28 && botFrac <= 0.52
-              ? 8
-              : -35;
-        const midOk = midFrac < 0.1 ? 22 : midFrac < 0.16 ? 6 : -30;
+          botFrac >= 0.5 && botFrac <= 0.54
+            ? 36
+            : botFrac >= 0.46 && botFrac < 0.5
+              ? 28
+              : botFrac >= 0.32 && botFrac <= 0.48
+                ? 20
+                : botFrac >= 0.28 && botFrac <= 0.55
+                  ? 6
+                  : -35;
+        // 本 demo／後方視角單道常略偏左；mid 貼右半易鎖鄰道
+        const midRightPen =
+          midBot / vw > 0.52 ? -18 : midBot / vw > 0.5 ? -8 : 0;
+        const midOk =
+          (midFrac < 0.1 ? 22 : midFrac < 0.16 ? 6 : -30) + midRightPen;
         return { ...c, rank: c.geom + widthOk + midOk };
       });
       ranked.sort((a, b) => b.rank - a.rank);
       if (ranked.length >= 1) {
-        result = ranked[0].det;
+        result = {
+          ...ranked[0].det,
+          corners: snapCornersToTrueGutter(
+            ranked[0].det.corners,
+            v.videoWidth,
+            v.videoHeight
+          ),
+        };
         bestScore = ranked[0].rank;
       }
 
       // 上傳片：先抓連續幀 buffer（~15fps），再用共用探針揀角
       // （舊版疏 seek 會令 tracker 永不 lock → 探針形同虛設 → UI 仍用幾何角 → arrows~21）
+      // foul Y 投票移到探針之後：有合格 arrows 時唔改（防拧 H → arr≈28.5）
       let probeNote = "";
+      let probeArrowsGood = false;
       if (isUpload && dur > 0 && ranked.length >= 1) {
         const probeFps = 15;
         const probeN = Math.min(90, Math.max(40, Math.floor(Math.min(dur, 6.5) * probeFps)));
@@ -391,21 +437,60 @@ export default function Workbench() {
           const picked = pickBestCornersByProbe(
             ranked.map((c) => ({ det: c.det, geomRank: c.rank })),
             frames,
-            5
+            10
           );
           if (picked) {
-            result = picked.det;
+            // 再 snap：保證 mid／bot 唔受候選 foulY 差影響
+            result = {
+              ...picked.det,
+              corners: snapCornersToTrueGutter(
+                picked.det.corners,
+                v.videoWidth,
+                v.videoHeight
+              ),
+            };
             bestScore = picked.detail.score;
+            const pa = picked.detail.arrows;
+            const tonyBand =
+              pa != null && pa >= 12.5 && pa <= 15.5;
+            probeArrowsGood =
+              tonyBand ||
+              (pa != null &&
+                pa >= 6 &&
+                pa <= 20 &&
+                !(pa >= 19 && pa <= 22.5) &&
+                !picked.detail.gutterRace);
             probeNote = ` · 探針${frames.length}幀 arr=${
-              picked.detail.arrows != null
-                ? picked.detail.arrows.toFixed(1)
-                : "—"
+              pa != null ? pa.toFixed(1) : "—"
             } med=${
               picked.detail.med != null ? picked.detail.med.toFixed(1) : "—"
             }`;
           }
         } else {
           probeNote = ` · 探針幀不足(${frames.length})`;
+        }
+      }
+
+      // Black-Lights foul Y：只喺探針無合格 arrows 時微調（有好 arr 時改 foul 會拧透視）
+      if (result && ranked.length >= 2 && !probeArrowsGood) {
+        const vh = v.videoHeight || 1;
+        const foulYs = ranked
+          .slice(0, Math.min(6, ranked.length))
+          .map((c) => (c.det.corners.bl.y + c.det.corners.br.y) / 2);
+        const voted = voteFoulYAcrossFrames(foulYs, vh);
+        if (voted != null) {
+          const cur =
+            (result.corners.bl.y + result.corners.br.y) / 2;
+          if (Math.abs(voted - cur) <= vh * 0.025) {
+            result = {
+              ...result,
+              corners: {
+                ...result.corners,
+                bl: { ...result.corners.bl, y: voted },
+                br: { ...result.corners.br, y: voted },
+              },
+            };
+          }
         }
       }
 
@@ -621,7 +706,40 @@ export default function Workbench() {
     }
 
     const rpm = getRpmEstimate(trackerRef.current);
-    const estimate = computeShotEstimate(points, rpm);
+    const pbaMode = !!settingsRef.current.boardFromRight;
+    // bowling-demo only：剔爬溝頭；PBA 手動路徑唔修剪（否則 Arrows／BP —）
+    let estPoints = points;
+    if (sourceModeRef.current === "upload" && !pbaMode) {
+      const trimmed = points.filter(
+        (p) =>
+          !p.lane ||
+          p.lane.feet >= 25 ||
+          (p.lane.board > 8 && p.lane.board <= 18)
+      );
+      if (trimmed.filter((p) => p.lane).length >= 8) estPoints = trimmed;
+    }
+    const estimate = computeShotEstimate(estPoints, rpm, {
+      boardFromRight: pbaMode,
+    });
+    // PBA：只存合理箭頭帶 Arr∈[6,17.5]（殺 mid-dump 19.9／Arr—／溝邊假值）
+    // 01 BP— 可接受；10 要靠真球鎖先有 Arr~14。唔夠格就清軌再追，唔標本圈已存。
+    if (pbaMode) {
+      const arr = estimate.arrowsBoard;
+      const arrOk = arr != null && arr >= 6 && arr <= 17.5;
+      if (!arrOk) {
+        setLivePath([]);
+        setStatus(
+          arr == null
+            ? "PBA 箭頭不足已忽略，繼續追蹤…"
+            : `PBA 箭頭異常（${arr}）已忽略，繼續追蹤…`
+        );
+        pbaSawHighBoardRef.current = false;
+        gutterRejectStreakRef.current = 0;
+        trackerRef.current.beginNewShot({ clearBg: true });
+        finishingRef.current = false;
+        return;
+      }
+    }
     const shot: Shot = {
       id: `shot_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
       createdAt: Date.now(),
@@ -629,7 +747,31 @@ export default function Workbench() {
       estimate,
       source: sourceModeRef.current === "upload" ? "upload" : "camera",
     };
+    // 先鎖本圈／冷卻，再 append——避免 RAF 同幀連存 6 投
+    lastSavedShotRef.current = { points, createdAt: shot.createdAt };
+    shotCooldownUntilRef.current = now + 2800;
+    if (sourceModeRef.current === "upload") {
+      loopCycleSavedRef.current = true;
+      savedLoopGenRef.current = loopGenRef.current;
+    }
     setLiveEstimate(estimate);
+    {
+      const oriented = points
+        .filter((p) => p.lane && !p.predicted)
+        .slice(0, 40)
+        .map((p) => `${p.lane!.feet.toFixed(1)}L${p.lane!.board.toFixed(1)}`)
+        .join("|");
+      lastDebugShotRef.current = {
+        estimate,
+        n: points.length,
+        boardsSample: oriented,
+        pba: pbaMode,
+      };
+      if (typeof window !== "undefined") {
+        (window as unknown as { __bowlLastShot?: unknown }).__bowlLastShot =
+          lastDebugShotRef.current;
+      }
+    }
     setLivePath(points.filter((p) => p.lane).map((p) => p.lane!));
     // appendShot 唔可以放 setState updater（Strict Mode 會跑兩次 → 成對重複）
     const sid = sessionRef.current?.id;
@@ -646,12 +788,6 @@ export default function Workbench() {
           return next;
         });
       }
-    }
-    lastSavedShotRef.current = { points, createdAt: shot.createdAt };
-    shotCooldownUntilRef.current = now + 2200;
-    if (sourceModeRef.current === "upload") {
-      loopCycleSavedRef.current = true;
-      savedLoopGenRef.current = loopGenRef.current;
     }
     const covTxt =
       estimate.coverageFeetMax != null
@@ -672,7 +808,9 @@ export default function Workbench() {
           : "無球速"
       }${covTxt}${rpmTxt}`
     );
-    trackerRef.current.beginNewShot();
+    trackerRef.current.beginNewShot({
+      clearBg: sourceModeRef.current === "upload",
+    });
     finishingRef.current = false;
   }, []);
 
@@ -698,15 +836,20 @@ export default function Workbench() {
 
       if (trackingRef.current && cornersRef.current) {
         const now = performance.now();
-        const dt =
-          lastFrameTRef.current > 0
-            ? Math.min(80, now - lastFrameTRef.current)
-            : 33;
-        lastFrameTRef.current = now;
-
         // 影片 loop：必須「近尾→近頭」；唔好用單純時間回跳（易誤觸發再開一世代）
         const vt = v.currentTime;
         const prevVt = lastVideoTimeRef.current;
+        // upload：用影片時間做 dt／軌跡 t（唔用 wall clock——headless／變速會令球速炸掉）
+        let dt: number;
+        if (sourceModeRef.current === "upload" && prevVt > 0 && vt >= prevVt) {
+          dt = Math.min(80, Math.max(1, (vt - prevVt) * 1000));
+        } else {
+          dt =
+            lastFrameTRef.current > 0
+              ? Math.min(80, now - lastFrameTRef.current)
+              : 33;
+        }
+        lastFrameTRef.current = now;
         const dur = Number.isFinite(v.duration) && v.duration > 0 ? v.duration : 0;
         const nearEnd = dur > 0 ? prevVt > dur * 0.55 : prevVt > 4;
         const nearStart = vt < Math.min(1.25, dur > 0 ? dur * 0.18 : 1.25);
@@ -728,20 +871,50 @@ export default function Workbench() {
             !finishingRef.current &&
             !alreadySaved
           ) {
-            finishingRef.current = true;
-            finishShot();
+            const pts = livePointsRef.current;
+            const feet = pts.filter((p) => p.lane).map((p) => p.lane!.feet);
+            const span =
+              feet.length >= 2 ? Math.max(...feet) - Math.min(...feet) : 0;
+            // 短碎軌（入溝）唔存；等下一圈完整 foul→pocket
+            if (span >= 12 && evaluateShotQuality(pts).ok) {
+              finishingRef.current = true;
+              finishShot();
+            } else {
+              livePointsRef.current = [];
+              trackerRef.current.beginNewShot({ clearBg: true });
+            }
           } else {
             livePointsRef.current = [];
-            trackerRef.current.beginNewShot();
+            trackerRef.current.beginNewShot({ clearBg: true });
           }
-          // 新圈：世代 +1，允許再存一投
+          // 新圈：世代 +1，允許再存一投；強制清 bg（防第2圈鎖右溝）
           loopGenRef.current += 1;
           loopCycleSavedRef.current = false;
+          trackerRef.current.beginNewShot({ clearBg: true });
           lastVideoTimeRef.current = vt;
+          lastTrackedVtRef.current = -1;
+          gutterRejectStreakRef.current = 0;
+          pbaSawHighBoardRef.current = false;
+          demoInsetActiveRef.current = true;
           drawOverlay();
           return;
         }
         lastVideoTimeRef.current = vt;
+
+        // upload：同幀唔重跑；bowling-demo 另限 ~15fps（PBA 唔限——60fps 片限 15 會丟 foul／BP）
+        if (sourceModeRef.current === "upload") {
+          const pbaMode = !!settingsRef.current.boardFromRight;
+          const minDt = pbaMode ? 1e-4 : 1 / 15;
+          if (
+            lastTrackedVtRef.current >= 0 &&
+            vt + 1e-6 < lastTrackedVtRef.current + minDt &&
+            vt + 1e-4 >= lastTrackedVtRef.current
+          ) {
+            drawOverlay();
+            return;
+          }
+        }
+        lastTrackedVtRef.current = vt;
 
         // 高解析度縮到 ~640 寬再追（同 offline verify）；座標映射返原圖
         const { scale, tw, th } = trackWorkSize(w, h);
@@ -774,6 +947,20 @@ export default function Workbench() {
         } else {
           const frame = ctx.getImageData(0, 0, w, h);
           trackRgba = frame.data;
+        }
+        // bowling-demo upload：inset 避溝；fastRelock 期間全角以便 12–18′ 抓真球
+        {
+          const pbaMode = !!settingsRef.current.boardFromRight;
+          const fast = trackerRef.current.fastRelockFrames > 0;
+          if (
+            sourceModeRef.current === "upload" &&
+            !pbaMode &&
+            demoInsetActiveRef.current &&
+            !fast &&
+            trackCorners
+          ) {
+            trackCorners = insetLaneCorners(trackCorners, 0.15);
+          }
         }
         const gray = rgbaToGray(trackRgba, trackW, trackH);
         const result = trackBallFrame(
@@ -810,6 +997,13 @@ export default function Workbench() {
               }
             : result.smoothed
           : null;
+        // Corra：homography 用球底 (y+r)，overlay 仍畫圓心
+        const radiusFull =
+          result.radius != null && result.radius > 0
+            ? scale < 1
+              ? result.radius / scale
+              : result.radius
+            : null;
         if (
           !blockNewShot &&
           result.locked &&
@@ -821,33 +1015,186 @@ export default function Workbench() {
             setStatus("已鎖定球，追蹤中…");
           }
           if (livePointsRef.current.length > 0 || !result.predicted) {
-            const t = performance.now() - shotStartRef.current;
+            const t =
+              sourceModeRef.current === "upload"
+                ? Math.round(vt * 1000)
+                : performance.now() - shotStartRef.current;
             const H = homoRef.current;
-            const lane = H ? imageToLane(H, pos) : undefined;
+            let contact = ballContactPoint(pos, radiusFull);
+            let lane = H ? imageToLane(H, contact) : undefined;
+            // demo densify：fastRelock 期間預測點若喺 12–18′，X 吸到 board~14 軌
+            // （避免 ema 左/右漂令 apex board 10 或 16.5，Arr 要靠 clamp）
+            {
+              const pbaMode = !!settingsRef.current.boardFromRight;
+              const fast = trackerRef.current.fastRelockFrames > 0;
+              const full = cornersRef.current;
+              if (
+                !pbaMode &&
+                sourceModeRef.current === "upload" &&
+                result.predicted &&
+                fast &&
+                lane &&
+                full &&
+                H &&
+                lane.feet >= 12 &&
+                lane.feet <= 18
+              ) {
+                const foulY = (full.bl.y + full.br.y) / 2;
+                const pinY = (full.tl.y + full.tr.y) / 2;
+                const t =
+                  Math.abs(foulY - pinY) > 1
+                    ? Math.max(
+                        0,
+                        Math.min(1, (foulY - contact.y) / (foulY - pinY))
+                      )
+                    : 0.25;
+                const leftX = full.bl.x + (full.tl.x - full.bl.x) * t;
+                const rightX = full.br.x + (full.tr.x - full.br.x) * t;
+                const tx = leftX + (rightX - leftX) * (14.3 / 39);
+                contact = { x: tx, y: contact.y };
+                lane = imageToLane(H, contact) ?? lane;
+              }
+            }
             // 過濾明顯不合理的瞬間跳點（lane 空間）
             const prev = livePointsRef.current[livePointsRef.current.length - 1];
             let accept = true;
-            if (lane && !result.predicted) {
-              // 明顯出溝／夾到左溝邊且非 pin 區：拒絕
-              // 手動點選後放寬（跟真實球路，含近溝合法球）
+            if (lane) {
               const seeded = trackerRef.current.seed != null;
-              const edgeBoard = seeded ? 0.15 : 1.2;
-              if (
-                (lane.board < edgeBoard || lane.board > 39 - edgeBoard) &&
-                lane.feet < 45
-              ) {
-                accept = false;
+              const pbaMode = !!settingsRef.current.boardFromRight;
+              if (sourceModeRef.current === "upload" && !seeded && pbaMode) {
+                // PBA：同 offline soft edge（拒爬溝／15fps 會令覆蓋只剩 19–22′）
+                if (
+                  (lane.board < 0.3 || lane.board > 38.7) &&
+                  lane.feet < 50
+                ) {
+                  accept = false;
+                }
+                // 早期／中段假鎖：左規 mid 14–23.5 喺 <25′（真球箭頭區左規 ≳24）
+                // 舊 <20′/10–22.5 唔夠——UI 會喺 ≥20′ 鎖 mid L~19 → 翻轉 Arr 19.9 / BP—
+                if (
+                  lane.feet < 25 &&
+                  lane.board > 14 &&
+                  lane.board < 23.5
+                ) {
+                  accept = false;
+                }
+                // 真球左規 ≳24；若從未見過且喺 ≥25′ 持續 mid 15–23.5 → 解鎖重追
+                if (accept) {
+                  if (lane.board >= 24) {
+                    pbaSawHighBoardRef.current = true;
+                    gutterRejectStreakRef.current = 0;
+                  } else if (
+                    !pbaSawHighBoardRef.current &&
+                    lane.feet >= 25 &&
+                    lane.board > 15 &&
+                    lane.board < 23.5
+                  ) {
+                    gutterRejectStreakRef.current += 1;
+                    if (gutterRejectStreakRef.current >= 10) {
+                      accept = false;
+                      livePointsRef.current = [];
+                      setLivePath([]);
+                      setLiveEstimate(null);
+                      trackerRef.current.beginNewShot({ clearBg: true });
+                      gutterRejectStreakRef.current = 0;
+                      pbaSawHighBoardRef.current = false;
+                    }
+                  }
+                }
+              } else if (sourceModeRef.current === "upload" && !seeded) {
+                // bowling-demo：拒爬溝／晚段高 board；@≥24 softRelock（保留 bg）
+                if (lane.feet < 52 && (lane.board >= 25.5 || lane.board <= 5)) {
+                  accept = false;
+                }
+                if (lane.feet < 22 && (lane.board >= 22 || lane.board <= 7)) {
+                  accept = false;
+                }
+                if (lane.feet < 40 && (lane.board >= 24 || lane.board <= 5)) {
+                  gutterRejectStreakRef.current += 1;
+                  if (gutterRejectStreakRef.current >= 1) {
+                    const sc = trackScaleRef.current;
+                    const full = cornersRef.current;
+                    if (full) {
+                      trackerRef.current.softRelockMid(
+                        sc < 1 ? scaleLaneCorners(full, sc) : full
+                      );
+                    } else {
+                      trackerRef.current.beginNewShot({ clearBg: true });
+                    }
+                    gutterRejectStreakRef.current = 0;
+                    demoInsetActiveRef.current = true;
+                  }
+                } else if (lane.board > 7 && lane.board < 24) {
+                  gutterRejectStreakRef.current = 0;
+                }
+              } else {
+                const edgeBoard = seeded ? 0.15 : 1.2;
+                if (
+                  (lane.board < edgeBoard || lane.board > 39 - edgeBoard) &&
+                  lane.feet < 48
+                ) {
+                  accept = false;
+                }
               }
             }
-            if (accept && prev?.lane && lane && !result.predicted) {
-              const dFeet = Math.abs(lane.feet - prev.lane.feet);
+            if (accept && prev?.lane && lane) {
+              const dFeet = lane.feet - prev.lane.feet;
               const dBoard = Math.abs(lane.board - prev.lane.board);
               const dtPt = Math.max(1, t - prev.t) / 1000;
-              if (dFeet / dtPt > 80 || dBoard > 10) accept = false;
+              const pbaMode = !!settingsRef.current.boardFromRight;
+              if (pbaMode) {
+                // PBA：同 offlineSoft 容許變焦回退
+                if (dFeet < -8.0) accept = false;
+                if (dBoard > 28) accept = false;
+              } else {
+                if (dFeet < -0.8 || (dBoard > 3.5 && dFeet < 1.0)) accept = false;
+                if (Math.abs(dFeet) / dtPt > 90 || dBoard > 14) accept = false;
+                if (
+                  sourceModeRef.current === "upload" &&
+                  lane.board > 22 &&
+                  dFeet > 0.35 &&
+                  dBoard / dFeet > 1.5
+                ) {
+                  accept = false;
+                }
+              }
             }
             if (accept) {
+              // 跨過 14–16′ 大跳：插入 predicted 海岸點（真偵測疏時補 apex）
+              if (prev?.lane && lane && !result.predicted) {
+                const dF = lane.feet - prev.lane.feet;
+                if (
+                  dF > 3.5 &&
+                  prev.lane.feet < 15.5 &&
+                  lane.feet > 14.5 &&
+                  prev.lane.board > 9 &&
+                  prev.lane.board < 22 &&
+                  lane.board > 9 &&
+                  lane.board < 22
+                ) {
+                  for (const tf of [14, 15, 16]) {
+                    if (tf <= prev.lane.feet + 0.4 || tf >= lane.feet - 0.4)
+                      continue;
+                    const u = (tf - prev.lane.feet) / dF;
+                    let b =
+                      prev.lane.board + u * (lane.board - prev.lane.board);
+                    // 偏 tony 14–15；避免 coast 停喺 board 21
+                    b = b * 0.4 + 14.4 * 0.6;
+                    if (b < 12 || b > 16) continue;
+                    livePointsRef.current.push({
+                      image: {
+                        x: prev.image.x + u * (contact.x - prev.image.x),
+                        y: prev.image.y + u * (contact.y - prev.image.y),
+                      },
+                      lane: { feet: tf, board: b },
+                      t: prev.t + u * (t - prev.t),
+                      predicted: true,
+                    });
+                  }
+                }
+              }
               const tp: TrackPoint = {
-                image: pos,
+                image: contact,
                 lane,
                 t,
                 predicted: result.predicted || undefined,
@@ -860,7 +1207,9 @@ export default function Workbench() {
                 setLivePath(path);
                 const rpm = getRpmEstimate(trackerRef.current);
                 setLiveEstimate(
-                  computeShotEstimate(livePointsRef.current, rpm)
+                  computeShotEstimate(livePointsRef.current, rpm, {
+                    boardFromRight: settingsRef.current.boardFromRight,
+                  })
                 );
               }
             }
@@ -872,30 +1221,75 @@ export default function Workbench() {
           !uploadSavedThisLoop &&
           performance.now() >= shotCooldownUntilRef.current;
 
-        if (
-          canSaveShot &&
-          shouldEndShot(
-            trackerRef.current,
-            settingsRef.current,
-            livePointsRef.current.length > 0
-          )
-        ) {
-          finishingRef.current = true;
-          finishShot();
-        } else if (
-          !result.locked &&
-          livePointsRef.current.length > 0 &&
-          !finishingRef.current
-        ) {
-          // 誤鎖解除：夠格才存，否則丟棄
-          const pts = livePointsRef.current;
-          if (canSaveShot && evaluateShotQuality(pts).ok) {
-            finishingRef.current = true;
-            finishShot();
-          } else {
-            livePointsRef.current = [];
-            setLivePath([]);
-            trackerRef.current.beginNewShot();
+        {
+          const pbaMode = !!settingsRef.current.boardFromRight;
+          const liveFeet = livePointsRef.current
+            .filter((p) => p.lane)
+            .map((p) => p.lane!.feet);
+          const maxLiveFeet =
+            liveFeet.length > 0 ? Math.max(...liveFeet) : 0;
+          // PBA：要捱過變焦先收；未到 ~38′ 用更高 lost 門檻
+          const endSettings = pbaMode
+            ? {
+                ...settingsRef.current,
+                lostFramesToEnd: maxLiveFeet >= 38 ? 48 : 72,
+              }
+            : settingsRef.current;
+          if (
+            canSaveShot &&
+            shouldEndShot(
+              trackerRef.current,
+              endSettings,
+              livePointsRef.current.length > 0
+            )
+          ) {
+            let allowFinish = true;
+            if (pbaMode && livePointsRef.current.length > 0) {
+              const peek = computeShotEstimate(livePointsRef.current, null, {
+                boardFromRight: true,
+              });
+              const arr = peek.arrowsBoard;
+              const arrOk = arr != null && arr >= 6 && arr <= 17.5;
+              // Arr 未入帶：唔收——重置 lost 再捱（真球可能仲未鎖穩）
+              if (!arrOk) {
+                allowFinish = false;
+                trackerRef.current.lost = 0;
+                // 覆蓋已深但仍 mid-dump：丟軌重鎖，避免無限捱同一條假軌
+                const maxF = peek.coverageFeetMax ?? 0;
+                if (maxF >= 36) {
+                  livePointsRef.current = [];
+                  setLivePath([]);
+                  setLiveEstimate(null);
+                  trackerRef.current.beginNewShot({ clearBg: true });
+                }
+              }
+            }
+            if (allowFinish) {
+              finishingRef.current = true;
+              finishShot();
+            }
+          } else if (
+            !result.locked &&
+            livePointsRef.current.length > 0 &&
+            !finishingRef.current
+          ) {
+            const pts = livePointsRef.current;
+            if (sourceModeRef.current === "upload") {
+              // 溝拒解鎖後一律保留軌跡；只有完全冇 lane 點先丟
+              const nLane = pts.filter((p) => p.lane).length;
+              if (nLane < 1) {
+                livePointsRef.current = [];
+                setLivePath([]);
+                trackerRef.current.beginNewShot({ clearBg: true });
+              }
+            } else if (canSaveShot && evaluateShotQuality(pts).ok) {
+              finishingRef.current = true;
+              finishShot();
+            } else {
+              livePointsRef.current = [];
+              setLivePath([]);
+              trackerRef.current.beginNewShot();
+            }
           }
         }
       } else {
@@ -983,6 +1377,10 @@ export default function Workbench() {
   };
 
   const startTracking = () => {
+    lastDebugShotRef.current = null;
+    if (typeof window !== "undefined") {
+      (window as unknown as { __bowlLastShot?: unknown }).__bowlLastShot = null;
+    }
     if (!corners) {
       setStatus("請先完成四角標定");
       return;
@@ -1000,6 +1398,10 @@ export default function Workbench() {
     setPhase("track");
     setTracking(true);
     lastVideoTimeRef.current = 0;
+    lastTrackedVtRef.current = -1;
+    gutterRejectStreakRef.current = 0;
+    pbaSawHighBoardRef.current = false;
+    demoInsetActiveRef.current = true;
     finishingRef.current = false;
     shotCooldownUntilRef.current = 0;
     loopCycleSavedRef.current = false;
@@ -1038,6 +1440,36 @@ export default function Workbench() {
     setPhase("calibrate");
     setStatus("已停止追蹤");
   };
+
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const w = window as unknown as {
+      __bowlDebug?: {
+        setCorners: (c: LaneCorners) => void;
+        setPba: (v: boolean) => void;
+        start: () => void;
+        stop: () => void;
+        getLast: () => unknown;
+        getStatus: () => string;
+      };
+    };
+    w.__bowlDebug = {
+      setCorners: (c) => persistCorners(c),
+      setPba: (v) =>
+        setSettings((s) => ({
+          ...s,
+          boardFromRight: v,
+        })),
+      start: () => startTracking(),
+      stop: () => stopTracking(),
+      getLast: () => lastDebugShotRef.current,
+      getStatus: () => status,
+    };
+    return () => {
+      delete w.__bowlDebug;
+    };
+  });
 
   const resetSession = () => {
     if (!session) return;
@@ -1277,6 +1709,20 @@ export default function Workbench() {
                 {showAdvanced ? "收合進階" : "進階參數"}
               </button>
             </div>
+            <label className="mt-2 flex items-center gap-2 text-sm text-amber-200/90">
+              <input
+                type="checkbox"
+                checked={!!settings.boardFromRight}
+                onChange={(e) =>
+                  setSettings((s) => ({
+                    ...s,
+                    boardFromRight: e.target.checked,
+                  }))
+                }
+                className="accent-amber-500"
+              />
+              PBA board（右溝=0，39−x）— 手動四角追 PBA 片請勾
+            </label>
 
             {showAdvanced && (
               <div className="mt-3 space-y-2 border-t border-slate-800 pt-3 text-[11px] text-slate-400">
