@@ -1,4 +1,5 @@
 import Link from "next/link";
+import AuthBar from "@/components/AuthBar";
 import Workbench from "@/components/Workbench";
 
 export default function SessionPage() {
@@ -17,9 +18,12 @@ export default function SessionPage() {
               球局工作台
             </h1>
           </div>
-          <span className="rounded-full bg-slate-800 px-2.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-slate-400">
-            v0.2
-          </span>
+          <div className="flex items-center gap-3">
+            <AuthBar compact />
+            <span className="rounded-full bg-slate-800 px-2.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-slate-400">
+              v0.3
+            </span>
+          </div>
         </div>
       </header>
       <Workbench />

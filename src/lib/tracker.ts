@@ -3,12 +3,12 @@ import type { LaneCorners, Point2D, TrackerSettings } from "./types";
 export const DEFAULT_TRACKER: TrackerSettings = {
   sensitivity: 28,
   minBlobPixels: 35,
-  lostFramesToEnd: 12,
+  lostFramesToEnd: 15,
   emaAlpha: 0.5,
   autoSensitivity: true,
   bgLearningRate: 0.035,
   rpmEnabled: true,
-  rpmMinContrast: 18,
+  rpmMinContrast: 22,
 };
 
 /** 可選：限制搜尋 ROI */
@@ -63,6 +63,8 @@ export class BallTrackerState {
   rpmSamples: number[] = [];
   lastRpm: number | null = null;
   lastRpmConf = 0;
+  /** RPM 鎖定中位值（低信心時不亂跳） */
+  rpmLocked: number | null = null;
   /** 手動／自動鎖定後才開始累積軌跡 */
   locked = false;
   /** 點選種子（影像座標） */
@@ -87,6 +89,7 @@ export class BallTrackerState {
     this.rpmSamples = [];
     this.lastRpm = null;
     this.lastRpmConf = 0;
+    this.rpmLocked = null;
     this.locked = false;
     this.seed = null;
     this.outOfLaneFrames = 0;
@@ -125,6 +128,7 @@ export class BallTrackerState {
     this.rpmSamples = [];
     this.lastRpm = null;
     this.lastRpmConf = 0;
+    this.rpmLocked = null;
   }
 }
 
@@ -184,9 +188,11 @@ export function ballColorScore(r: number, g: number, b: number): number {
   const sat = maxc - minc;
   const lum = (r + g + b) / 3;
 
-  // 純綠／純紅導引線：重罰
-  if (g > r * 1.25 && g > b * 1.25 && g > 80) return 0.05;
-  if (r > g * 1.35 && r > b * 1.15 && r > 140 && g < 100) return 0.08;
+  // 純綠／純紅導引線：重罰（demo 常有綠左溝／紅右溝線）
+  if (g > r * 1.18 && g > b * 1.18 && g > 70) return 0.04;
+  if (r > g * 1.3 && r > b * 1.1 && r > 130 && g < 110) return 0.06;
+  // 高飽和綠邊（略帶黃）
+  if (g > 140 && g > r + 25 && g > b + 25) return 0.05;
 
   // 紫色／洋紅：R、B 明顯高於 G
   const purple =
@@ -308,10 +314,10 @@ export function trackBallFrame(
   const blobScore = blob?.score ?? 0;
 
   // 自動鎖定：高分圓形色球 + 位置有位移（避免鎖死導引線／反光）
-  const LOCK_SCORE = 60;
+  const LOCK_SCORE = 65;
   if (blob) {
     state.recentCenters.push({ x: blob.cx, y: blob.cy });
-    if (state.recentCenters.length > 10) state.recentCenters.shift();
+    if (state.recentCenters.length > 12) state.recentCenters.shift();
   }
   const motionSpan = (() => {
     const pts = state.recentCenters;
@@ -327,10 +333,22 @@ export function trackBallFrame(
   })();
 
   if (!state.locked && blob && blob.score >= LOCK_SCORE) {
-    const moving = motionSpan >= 10 || (state.seed != null);
-    if (moving) {
+    // 要求真實位移；純靜物／溝邊反光唔鎖
+    const moving = motionSpan >= 18 || state.seed != null;
+    // 後方視角：往 pins 大致向上（y 減）
+    let towardPins = true;
+    if (state.recentCenters.length >= 4 && !state.seed) {
+      const a = state.recentCenters[0];
+      const b = state.recentCenters[state.recentCenters.length - 1];
+      const pinY = (corners.tl.y + corners.tr.y) / 2;
+      const foulY = (corners.bl.y + corners.br.y) / 2;
+      if (foulY > pinY) {
+        towardPins = b.y <= a.y + 6; // 允許微抖
+      }
+    }
+    if (moving && towardPins) {
       state.lockStreak += 1;
-      if (state.lockStreak >= 2 || state.seed) {
+      if (state.lockStreak >= 3 || state.seed) {
         state.locked = true;
         state.staticFrames = 0;
       }
@@ -593,12 +611,27 @@ export function findBestBallBlob(
         if (d > preferRadius) score *= 0.15;
         else score *= 1.35 - (d / preferRadius) * 0.55;
       } else {
-        // 未鎖定：略偏好球道中線與中段（減少鎖球員／邊緣）
+        // 未鎖定：偏好球道中線／中下段（foul 附近出發），重罰貼左右溝
         const midX = (corners.tl.x + corners.tr.x + corners.bl.x + corners.br.x) / 4;
-        const midY = (corners.tl.y + corners.tr.y + corners.bl.y + corners.br.y) / 4;
-        const dMid = Math.hypot(cx - midX, cy - midY);
+        const foulY = (corners.bl.y + corners.br.y) / 2;
+        const pinY = (corners.tl.y + corners.tr.y) / 2;
         const laneW = Math.hypot(corners.tr.x - corners.tl.x, corners.tr.y - corners.tl.y);
-        score *= 1.1 - Math.min(0.4, dMid / Math.max(40, laneW));
+        const dMidX = Math.abs(cx - midX);
+        score *= 1.2 - Math.min(0.55, dMidX / Math.max(40, laneW * 0.55));
+        // 偏好較接近 foul（下方）出發，減少鎖 pin 區雜訊／上沿 UI
+        const ySpan = Math.max(20, Math.abs(foulY - pinY));
+        const fromFoul = Math.abs(cy - foulY) / ySpan;
+        if (fromFoul < 0.55) score *= 1.12;
+        else if (fromFoul > 0.85) score *= 0.65;
+        const laneLeft = Math.min(corners.tl.x, corners.bl.x);
+        const laneRight = Math.max(corners.tr.x, corners.br.x);
+        const laneSpan = Math.max(20, laneRight - laneLeft);
+        const edgeFrac = Math.min(cx - laneLeft, laneRight - cx) / laneSpan;
+        // 溝邊重罰（尤其左溝 board≈0），但唔要過罰正路近 board 10
+        if (edgeFrac < 0.06) score *= 0.12;
+        else if (edgeFrac < 0.1) score *= 0.28;
+        else if (edgeFrac < 0.16) score *= 0.55;
+        else if (edgeFrac < 0.22) score *= 0.8;
       }
 
       // 中等大小加分
@@ -686,15 +719,31 @@ function updateRpm(
       state.rpmSamples.push(rpm);
       if (state.rpmSamples.length > 24) state.rpmSamples.shift();
       const med = median(state.rpmSamples);
-      state.lastRpm = Math.round(med);
       const confContrast = Math.min(1, contrast / 60);
       const confN = Math.min(1, state.rpmSamples.length / 12);
       const spread = mad(state.rpmSamples, med) / Math.max(1, med);
-      const confStable = Math.max(0, 1 - spread * 2);
-      state.lastRpmConf = Math.max(
+      const confStable = Math.max(0, 1 - spread * 2.2);
+      const conf = Math.max(
         0,
         Math.min(1, confContrast * 0.4 + confN * 0.3 + confStable * 0.3)
       );
+      state.lastRpmConf = conf;
+      // 高信心時鎖定區間；低信心不更新顯示值（避免亂跳）
+      if (conf >= 0.55 && state.rpmSamples.length >= 8) {
+        state.rpmLocked = Math.round(med);
+        state.lastRpm = state.rpmLocked;
+      } else if (conf >= 0.42 && state.rpmLocked != null) {
+        // 維持鎖定值，允許小幅靠攏
+        const mix = Math.round(state.rpmLocked * 0.85 + med * 0.15);
+        state.rpmLocked = mix;
+        state.lastRpm = mix;
+      } else if (conf >= 0.42 && state.rpmSamples.length >= 10) {
+        state.lastRpm = Math.round(med);
+      } else {
+        // 信心不足：不輸出亂跳值
+        state.lastRpm = state.rpmLocked;
+        if (state.rpmLocked == null) state.lastRpmConf = Math.min(conf, 0.35);
+      }
     }
   }
   state.prevPolar = polar;
@@ -786,7 +835,11 @@ export function getRpmEstimate(state: BallTrackerState): {
   rpm: number | null;
   confidence: number;
 } {
-  return { rpm: state.lastRpm, confidence: state.lastRpmConf };
+  const rpm =
+    state.lastRpmConf >= 0.55
+      ? state.lastRpm ?? state.rpmLocked
+      : null;
+  return { rpm, confidence: state.lastRpmConf };
 }
 
 /**

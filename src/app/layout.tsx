@@ -1,10 +1,11 @@
 import type { Metadata, Viewport } from "next";
+import Providers from "@/components/Providers";
 import "./globals.css";
 
 export const metadata: Metadata = {
   title: "Bowl Track — 保齡球球路追蹤",
   description:
-    "瀏覽器端保齡球球路追蹤：自動／手動四角、穩健追球、LaneTrax 風格指標與實驗性 RPM。",
+    "瀏覽器端保齡球球路追蹤：自動／手動四角、穩健追球、LaneTrax 風格指標與實驗性 RPM。可 Guest 本機或登入同步 Neon。",
 };
 
 export const viewport: Viewport = {
@@ -23,7 +24,9 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="zh-Hant">
-      <body className="min-h-dvh antialiased safe-pb">{children}</body>
+      <body className="min-h-dvh antialiased safe-pb">
+        <Providers>{children}</Providers>
+      </body>
     </html>
   );
 }

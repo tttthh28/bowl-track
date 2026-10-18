@@ -23,6 +23,14 @@ export type TrackPoint = {
   predicted?: boolean;
 };
 
+/** 指標是否超出實際軌跡覆蓋（外推） */
+export type EstimateExtrapolated = {
+  breakpoint?: boolean;
+  pocket?: boolean;
+  impactAngle?: boolean;
+  impactSpeed?: boolean;
+};
+
 export type ShotEstimate = {
   /** Foul line 附近 board（≈0–2′） */
   foulBoard: number | null;
@@ -52,7 +60,7 @@ export type ShotEstimate = {
   hookBoards: number | null;
   /** 簡化 Hook factor＝hookBoards / (BP feet − arrows feet) */
   hookFactor: number | null;
-  /** 一投時長（秒） */
+  /** 一投時長（秒）：鎖定至結束 */
   shotTimeSec: number | null;
   /**
    * 實驗性轉速 RPM。
@@ -63,6 +71,12 @@ export type ShotEstimate = {
   rpmConfidence: number | null;
   /** 軌跡點數 */
   pointCount: number;
+  /** 實際軌跡覆蓋 feet 下限（非預測） */
+  coverageFeetMin: number | null;
+  /** 實際軌跡覆蓋 feet 上限（非預測） */
+  coverageFeetMax: number | null;
+  /** 超出覆蓋範圍的指標標記 */
+  extrapolated: EstimateExtrapolated;
 };
 
 export type Shot = {

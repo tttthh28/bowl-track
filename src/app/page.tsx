@@ -1,18 +1,24 @@
 import Link from "next/link";
+import AuthBar from "@/components/AuthBar";
 
 export default function HomePage() {
   return (
     <main className="mx-auto flex min-h-dvh max-w-2xl flex-col justify-center gap-8 px-4 py-10">
-      <div>
-        <p className="mb-2 text-sm font-medium text-sky-400">Bowl Track</p>
-        <h1 className="text-3xl font-bold tracking-tight text-white sm:text-4xl">
-          保齡球球路追蹤
-        </h1>
-        <p className="mt-3 text-slate-400 leading-relaxed">
-          類似 LaneTrax 的瀏覽器版：鏡頭／上傳、自動或手動球道四角、穩健追球，並粗估
-          Foul／Arrows／Breakpoint／角度／球速／Hook／Shot time，以及實驗性 RPM。
-        </p>
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <p className="mb-2 text-sm font-medium text-sky-400">Bowl Track</p>
+          <h1 className="text-3xl font-bold tracking-tight text-white sm:text-4xl">
+            保齡球球路追蹤
+          </h1>
+        </div>
+        <AuthBar />
       </div>
+
+      <p className="text-slate-400 leading-relaxed">
+        類似 LaneTrax 的瀏覽器版：鏡頭／上傳、自動或手動球道四角、穩健追球，並粗估
+        Foul／Arrows／Breakpoint／角度／球速／Hook／Shot time，以及實驗性 RPM。
+        預設 Guest（localStorage）；可選登入後同步 Neon Postgres。
+      </p>
 
       <ol className="space-y-3 rounded-2xl border border-slate-800 bg-slate-900/60 p-5 text-sm text-slate-300">
         <li>
@@ -31,9 +37,10 @@ export default function HomePage() {
           背景模型＋ROI＋平滑／丟幀預測；投球後自動存檔。
         </li>
         <li>
-          <span className="font-semibold text-slate-100">4. 查看指標</span>
+          <span className="font-semibold text-slate-100">4. 帳號（可選）</span>
           <br />
-          側欄顯示 board、角度、球速、Hook、Shot time；RPM 標為實驗／需球標。
+          Guest 只存本機；登入＋DATABASE_URL 後球局寫入 Neon，並保留
+          localStorage 後備。
         </li>
       </ol>
 
@@ -44,12 +51,18 @@ export default function HomePage() {
         >
           開始追蹤
         </Link>
+        <Link
+          href="/login"
+          className="inline-flex items-center justify-center rounded-xl border border-slate-700 px-5 py-3 text-center text-base font-semibold text-slate-200 hover:bg-slate-900"
+        >
+          登入同步雲端
+        </Link>
       </div>
 
       <p className="text-xs text-slate-600 leading-relaxed">
         已知限制：自動偵測在暗光／無明顯亮球道時易失敗；RPM
-        需球表高對比標記且信心常偏低；數值為軌跡粗估，非正式雷達／光學量測。資料僅存
-        localStorage。
+        需球表高對比標記且信心常偏低；數值為軌跡粗估。無 DATABASE_URL
+        時一律本機 localStorage。
       </p>
     </main>
   );

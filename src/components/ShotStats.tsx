@@ -40,12 +40,22 @@ function StatRow({
 export default function ShotStats({ liveEstimate, shots }: Props) {
   const last = shots[shots.length - 1];
   const est = liveEstimate ?? last?.estimate ?? null;
+  const ex = est?.extrapolated ?? {};
 
   return (
     <div className="rounded-xl border border-slate-700 bg-slate-900/80 p-3">
       <h3 className="mb-2 text-sm font-semibold text-slate-100">投球指標</h3>
       {est ? (
         <div className="divide-y divide-slate-800">
+          <StatRow
+            label="軌跡覆蓋"
+            value={
+              est.coverageFeetMin != null && est.coverageFeetMax != null
+                ? `${est.coverageFeetMin.toFixed(0)}–${est.coverageFeetMax.toFixed(0)}′`
+                : "—"
+            }
+            hint="指標只依實際覆蓋插值；不足顯示 — 或標外推"
+          />
           <StatRow label="Foul board (≈1′)" value={formatBoard(est.foulBoard)} />
           <StatRow
             label="Arrows / Entry (≈15′)"
@@ -55,7 +65,7 @@ export default function ShotStats({ liveEstimate, shots }: Props) {
             label="Breakpoint"
             value={
               est.breakpointBoard != null
-                ? `${formatBoard(est.breakpointBoard)}${
+                ? `${formatBoard(est.breakpointBoard, ex.breakpoint)}${
                     est.breakpointDistance != null
                       ? ` @ ${est.breakpointDistance}′`
                       : ""
@@ -63,11 +73,20 @@ export default function ShotStats({ liveEstimate, shots }: Props) {
                 : "—"
             }
           />
-          <StatRow label="進袋 board (≈58′)" value={formatBoard(est.pocketBoard)} />
+          <StatRow
+            label="進袋 board (≈58′)"
+            value={formatBoard(est.pocketBoard, ex.pocket)}
+          />
           <StatRow label="Launch 角" value={formatDeg(est.launchAngleDeg)} />
-          <StatRow label="Impact 角" value={formatDeg(est.impactAngleDeg)} />
+          <StatRow
+            label="Impact 角"
+            value={formatDeg(est.impactAngleDeg, ex.impactAngle)}
+          />
           <StatRow label="Launch 球速" value={formatMph(est.launchSpeedMph)} />
-          <StatRow label="Impact 球速" value={formatMph(est.impactSpeedMph)} />
+          <StatRow
+            label="Impact 球速"
+            value={formatMph(est.impactSpeedMph, ex.impactSpeed)}
+          />
           <StatRow
             label="平均球速"
             value={formatMph(est.avgSpeedMph ?? est.speedMph)}
@@ -91,11 +110,12 @@ export default function ShotStats({ liveEstimate, shots }: Props) {
             value={
               est.shotTimeSec != null ? `${est.shotTimeSec.toFixed(2)} s` : "—"
             }
+            hint="鎖定至結束"
           />
           <StatRow
             label="RPM（實驗）"
             value={formatRpm(est.rpm, est.rpmConfidence)}
-            hint="需清晰球標；低信心勿當真"
+            hint="低信心顯示 —；需清晰球標"
           />
           <StatRow label="軌跡點數" value={String(est.pointCount)} />
         </div>
@@ -110,11 +130,18 @@ export default function ShotStats({ liveEstimate, shots }: Props) {
           <ul className="mt-1 max-h-28 space-y-0.5 overflow-y-auto text-[11px] text-slate-500">
             {[...shots].reverse().map((s, i) => (
               <li key={s.id}>
-                #{shots.length - i} · 袋口 {formatBoard(s.estimate.pocketBoard)}{" "}
+                #{shots.length - i} · 袋口{" "}
+                {formatBoard(
+                  s.estimate.pocketBoard,
+                  s.estimate.extrapolated?.pocket
+                )}{" "}
                 ·{" "}
                 {s.estimate.avgSpeedMph != null || s.estimate.speedMph != null
                   ? `${s.estimate.avgSpeedMph ?? s.estimate.speedMph} mph`
                   : "—"}
+                {s.estimate.coverageFeetMax != null
+                  ? ` · ～${s.estimate.coverageFeetMax}′`
+                  : ""}
                 {s.estimate.rpm != null ? ` · ${s.estimate.rpm} rpm` : ""}
               </li>
             ))}

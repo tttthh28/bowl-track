@@ -203,7 +203,7 @@ export default function LaneMap({
         </g>
       </svg>
       <p className="mt-2 text-center text-[10px] text-slate-500">
-        箭頭≈15′ · BP≈42′ · 袋口≈60′
+        箭頭≈15′ · BP≈42′ · 袋口≈60′（路徑僅畫實際追蹤點）
       </p>
     </div>
   );

@@ -28,10 +28,14 @@ import {
   trackBallFrame,
 } from "@/lib/tracker";
 import {
+  evaluateShotQuality,
+  isDuplicateOfLastShot,
+} from "@/lib/shotQuality";
+import {
   appendShot,
   clearShots,
   createSession,
-  getSession,
+  resolveActiveSession,
   saveSession,
 } from "@/lib/storage";
 import type {
@@ -73,6 +77,21 @@ export default function Workbench() {
   const sourceModeRef = useRef<SourceMode>("idle");
   const lastVideoTimeRef = useRef<number>(0);
   const finishingRef = useRef(false);
+  /** 存檔後冷卻，避免短投連存 */
+  const shotCooldownUntilRef = useRef(0);
+  /** 上傳影片：本圈 loop 是否已存過一投 */
+  const loopCycleSavedRef = useRef(false);
+  /** 停止追蹤時只 flush 一次 */
+  const stopFlushDoneRef = useRef(false);
+  /** 上一投（去重） */
+  const lastSavedShotRef = useRef<{
+    points: TrackPoint[];
+    createdAt: number;
+  } | null>(null);
+  /** 本圈 loop 世代（回繞時 +1） */
+  const loopGenRef = useRef(0);
+  /** 已存檔嘅 loop 世代；同世代唔可再存 */
+  const savedLoopGenRef = useRef(-1);
 
   const [session, setSession] = useState<SessionRecord | null>(null);
   const [sourceMode, setSourceMode] = useState<SourceMode>("idle");
@@ -108,22 +127,21 @@ export default function Workbench() {
   }, [sourceMode]);
 
   useEffect(() => {
-    const existing =
-      typeof window !== "undefined"
-        ? localStorage.getItem("bowl-track-active-session")
-        : null;
-    if (existing) {
-      const s = getSession(existing);
-      if (s) {
-        setSession(s);
-        if (s.corners) setCorners(s.corners);
-        return;
-      }
-    }
-    const s = createSession();
-    saveSession(s);
-    localStorage.setItem("bowl-track-active-session", s.id);
-    setSession(s);
+    let cancelled = false;
+    (async () => {
+      const preferred =
+        typeof window !== "undefined"
+          ? localStorage.getItem("bowl-track-active-session")
+          : null;
+      const s = await resolveActiveSession(preferred);
+      if (cancelled) return;
+      localStorage.setItem("bowl-track-active-session", s.id);
+      setSession(s);
+      if (s.corners) setCorners(s.corners);
+    })();
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   const persistCorners = useCallback((c: LaneCorners) => {
@@ -331,32 +349,54 @@ export default function Workbench() {
     const points = [...livePointsRef.current];
     livePointsRef.current = [];
     trackerRef.current.lost = 0;
-    const travelPx = (() => {
-      let d = 0;
-      for (let i = 1; i < points.length; i++) {
-        d += Math.hypot(
-          points[i].image.x - points[i - 1].image.x,
-          points[i].image.y - points[i - 1].image.y
-        );
-      }
-      return d;
-    })();
-    const feetSpan = (() => {
-      const ls = points.filter((p) => p.lane).map((p) => p.lane!.feet);
-      if (ls.length < 2) return 0;
-      return Math.max(...ls) - Math.min(...ls);
-    })();
-    if (points.length < 5 || travelPx < 28 || feetSpan < 4) {
+
+    const now = performance.now();
+    const discard = (reason: string) => {
       setLivePath([]);
-      setStatus(
-        points.length === 0
-          ? "等待球出現…"
-          : "軌跡位移不足，已忽略（請點選紫色球，或確認四角／勿鎖導引線）"
-      );
+      setStatus(reason);
       trackerRef.current.beginNewShot();
       finishingRef.current = false;
+    };
+
+    // 上傳：本圈世代已存過則不再存
+    if (
+      sourceModeRef.current === "upload" &&
+      savedLoopGenRef.current === loopGenRef.current
+    ) {
+      discard("本圈已存一投，等待影片重播…");
       return;
     }
+    // 冷卻中：丟棄多餘短投
+    if (now < shotCooldownUntilRef.current) {
+      discard("冷卻中，已忽略多餘短投");
+      return;
+    }
+
+    const q = evaluateShotQuality(points);
+    if (!q.ok) {
+      discard(
+        points.length === 0
+          ? "等待球出現…"
+          : `軌跡不足已忽略（${q.reason}／${q.feetSpan.toFixed(1)}′／${(
+              q.durationMs / 1000
+            ).toFixed(2)}s；請點紫球或確認四角）`
+      );
+      return;
+    }
+
+    const last = lastSavedShotRef.current;
+    if (
+      isDuplicateOfLastShot(
+        points,
+        last?.points,
+        last?.createdAt,
+        Date.now()
+      )
+    ) {
+      discard("與上一投過近，已去重");
+      return;
+    }
+
     const rpm = getRpmEstimate(trackerRef.current);
     const estimate = computeShotEstimate(points, rpm);
     const shot: Shot = {
@@ -373,20 +413,31 @@ export default function Workbench() {
       const updated = appendShot(prev.id, shot);
       return updated ?? { ...prev, shots: [...prev.shots, shot] };
     });
-    const rpmTxt =
-      estimate.rpm != null
-        ? ` · RPM ${estimate.rpm}（實驗）`
+    lastSavedShotRef.current = { points, createdAt: shot.createdAt };
+    shotCooldownUntilRef.current = now + 2200;
+    if (sourceModeRef.current === "upload") {
+      loopCycleSavedRef.current = true;
+      savedLoopGenRef.current = loopGenRef.current;
+    }
+    const covTxt =
+      estimate.coverageFeetMax != null
+        ? ` · 覆蓋～${estimate.coverageFeetMax}′`
         : "";
+    const rpmTxt =
+      estimate.rpm != null ? ` · RPM ${estimate.rpm}（實驗）` : "";
+    const pocketLabel =
+      estimate.pocketBoard != null
+        ? `${estimate.pocketBoard.toFixed(1)}${
+            estimate.extrapolated?.pocket ? "外推" : ""
+          }`
+        : "—";
     setStatus(
-      `已存一投 · 袋口 ${
-        estimate.pocketBoard?.toFixed(1) ?? "—"
-      } · ${
+      `已存一投 · 袋口 ${pocketLabel} · ${
         estimate.avgSpeedMph != null
           ? estimate.avgSpeedMph + " mph"
           : "無球速"
-      }${rpmTxt}`
+      }${covTxt}${rpmTxt}`
     );
-    // 保留背景模型，重置本投追蹤狀態（等下一顆球／點選）
     trackerRef.current.beginNewShot();
     finishingRef.current = false;
   }, []);
@@ -419,18 +470,33 @@ export default function Workbench() {
             : 33;
         lastFrameTRef.current = now;
 
-        // 影片 loop：currentTime 回繞 → 立刻 flush 未完成投
+        // 影片 loop：需明顯回繞（避免緩衝微跳誤觸發多存）
         const vt = v.currentTime;
         const prevVt = lastVideoTimeRef.current;
-        if (
+        const dur = Number.isFinite(v.duration) && v.duration > 0 ? v.duration : 0;
+        const loopRewound =
           sourceModeRef.current === "upload" &&
-          prevVt > 0.4 &&
-          vt + 0.35 < prevVt &&
-          livePointsRef.current.length > 0 &&
-          !finishingRef.current
-        ) {
-          finishingRef.current = true;
-          finishShot();
+          prevVt > 1.2 &&
+          ((dur > 0 && prevVt > dur * 0.45 && vt < Math.min(1.5, dur * 0.2)) ||
+            prevVt - vt > 2.0);
+        if (loopRewound) {
+          const alreadySaved =
+            loopCycleSavedRef.current ||
+            savedLoopGenRef.current === loopGenRef.current;
+          if (
+            livePointsRef.current.length > 0 &&
+            !finishingRef.current &&
+            !alreadySaved
+          ) {
+            finishingRef.current = true;
+            finishShot();
+          } else {
+            livePointsRef.current = [];
+            trackerRef.current.beginNewShot();
+          }
+          // 新圈：世代 +1，允許再存一投
+          loopGenRef.current += 1;
+          loopCycleSavedRef.current = false;
           lastVideoTimeRef.current = vt;
           drawOverlay();
           return;
@@ -454,9 +520,19 @@ export default function Workbench() {
           setDebugNoise(Math.round(result.noiseLevel));
         }
 
+        // 本圈已存或冷卻中：不累積新軌跡，避免多餘短投
+        const uploadSavedThisLoop =
+          sourceModeRef.current === "upload" &&
+          (loopCycleSavedRef.current ||
+            savedLoopGenRef.current === loopGenRef.current);
+        const blockNewShot =
+          uploadSavedThisLoop ||
+          performance.now() < shotCooldownUntilRef.current;
+
         // 僅在已鎖定且有偵測／短預測時寫入軌跡（避免鎖導引線亂線）
         const pos = result.smoothed;
         if (
+          !blockNewShot &&
           result.locked &&
           pos &&
           (result.raw != null || result.predicted)
@@ -472,11 +548,23 @@ export default function Workbench() {
             // 過濾明顯不合理的瞬間跳點（lane 空間）
             const prev = livePointsRef.current[livePointsRef.current.length - 1];
             let accept = true;
-            if (prev?.lane && lane && !result.predicted) {
+            if (lane && !result.predicted) {
+              // 明顯出溝／夾到左溝邊且非 pin 區：拒絕
+              // 手動點選後放寬（跟真實球路，含近溝合法球）
+              const seeded = trackerRef.current.seed != null;
+              const edgeBoard = seeded ? 0.15 : 1.2;
+              if (
+                (lane.board < edgeBoard || lane.board > 39 - edgeBoard) &&
+                lane.feet < 45
+              ) {
+                accept = false;
+              }
+            }
+            if (accept && prev?.lane && lane && !result.predicted) {
               const dFeet = Math.abs(lane.feet - prev.lane.feet);
               const dBoard = Math.abs(lane.board - prev.lane.board);
               const dtPt = Math.max(1, t - prev.t) / 1000;
-              if (dFeet / dtPt > 80 || dBoard > 12) accept = false;
+              if (dFeet / dtPt > 80 || dBoard > 10) accept = false;
             }
             if (accept) {
               const tp: TrackPoint = {
@@ -500,8 +588,13 @@ export default function Workbench() {
           }
         }
 
-        if (
+        const canSaveShot =
           !finishingRef.current &&
+          !uploadSavedThisLoop &&
+          performance.now() >= shotCooldownUntilRef.current;
+
+        if (
+          canSaveShot &&
           shouldEndShot(
             trackerRef.current,
             settingsRef.current,
@@ -515,16 +608,9 @@ export default function Workbench() {
           livePointsRef.current.length > 0 &&
           !finishingRef.current
         ) {
-          // 誤鎖解除或尚未再鎖：有足夠位移則存檔，否則丟棄以免污染下一投
-          let travel = 0;
+          // 誤鎖解除：夠格才存，否則丟棄
           const pts = livePointsRef.current;
-          for (let i = 1; i < pts.length; i++) {
-            travel += Math.hypot(
-              pts[i].image.x - pts[i - 1].image.x,
-              pts[i].image.y - pts[i - 1].image.y
-            );
-          }
-          if (travel >= 28 && pts.length >= 5) {
+          if (canSaveShot && evaluateShotQuality(pts).ok) {
             finishingRef.current = true;
             finishShot();
           } else {
@@ -634,17 +720,37 @@ export default function Workbench() {
     setTracking(true);
     lastVideoTimeRef.current = 0;
     finishingRef.current = false;
+    shotCooldownUntilRef.current = 0;
+    loopCycleSavedRef.current = false;
+    stopFlushDoneRef.current = false;
+    loopGenRef.current = 0;
+    savedLoopGenRef.current = -1;
+    lastSavedShotRef.current = null;
     setStatus(
-      "等待紫色／暗色球出現…也可直接點球鎖定；消失或影片重播會自動存檔"
+      "等待紫色／暗色球出現…也可直接點球鎖定；消失或影片重播會自動存檔（每圈最多一投）"
     );
   };
 
   const stopTracking = () => {
-    if (livePointsRef.current.length >= 5) {
-      finishShot();
-    } else {
-      livePointsRef.current = [];
-      setLivePath([]);
+    if (!stopFlushDoneRef.current) {
+      stopFlushDoneRef.current = true;
+      if (
+        livePointsRef.current.length >= 10 &&
+        !finishingRef.current &&
+        !(
+          sourceModeRef.current === "upload" &&
+          (loopCycleSavedRef.current ||
+            savedLoopGenRef.current === loopGenRef.current)
+        )
+      ) {
+        finishingRef.current = true;
+        finishShot();
+      } else {
+        livePointsRef.current = [];
+        setLivePath([]);
+        trackerRef.current.beginNewShot();
+        finishingRef.current = false;
+      }
     }
     setTracking(false);
     setPhase("calibrate");
@@ -983,7 +1089,7 @@ export default function Workbench() {
             {tracking && (
               <p className="mt-2 text-[11px] text-orange-300/90">
                 追蹤中：偏好圓形紫／暗色球、忽略細長導引線。可點影片上的球強制鎖定；球出球道、到 pin
-                區後消失、或影片 loop 回繞時會結束並存檔。
+                區後消失、或影片 loop 回繞時會結束並存檔（每圈最多一投；冷卻避免短投連存）。指標只依實際軌跡覆蓋；不足顯示 — 或標外推。
               </p>
             )}
           </div>

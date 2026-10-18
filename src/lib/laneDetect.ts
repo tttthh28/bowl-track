@@ -111,8 +111,9 @@ export function detectLaneCorners(
   );
   if (!leftFit || !rightFit) return null;
 
-  const yFoul = sh * 0.86;
-  const yPins = sh * 0.16;
+  // pins 端提高（y 更細），避免 TL／TR 過低令球未到瓶口已出四角
+  const yFoul = sh * 0.88;
+  const yPins = sh * 0.08;
   let bl: Point2D = { x: leftFit.a + leftFit.b * yFoul, y: yFoul };
   let br: Point2D = { x: rightFit.a + rightFit.b * yFoul, y: yFoul };
   let tl: Point2D = { x: leftFit.a + leftFit.b * yPins, y: yPins };
@@ -127,11 +128,29 @@ export function detectLaneCorners(
     confidence = Math.min(confidence, 0.45);
   }
 
-  // 邊緣強化：在擬合附近用梯度微調（可選、輕量）
-  bl = nudgeEdge(gray, sw, sh, bl, -1);
-  br = nudgeEdge(gray, sw, sh, br, 1);
-  tl = nudgeEdge(gray, sw, sh, tl, -1);
-  tr = nudgeEdge(gray, sw, sh, tr, 1);
+  // 邊緣強化：foul 端可略偏外側；pins 端避免把 TL／TR 壓入溝／過低
+  bl = nudgeEdge(gray, sw, sh, bl, -1, 0.15);
+  br = nudgeEdge(gray, sw, sh, br, 1, 0.15);
+  tl = nudgeEdge(gray, sw, sh, tl, -1, 0.02);
+  tr = nudgeEdge(gray, sw, sh, tr, 1, 0.02);
+  // 確保 pins 端唔低過畫面 ~6%，foul 端唔高過 ~92%
+  const minPinY = sh * 0.05;
+  const maxFoulY = sh * 0.92;
+  if (tl.y > sh * 0.18) tl = { ...tl, y: sh * 0.1 };
+  if (tr.y > sh * 0.18) tr = { ...tr, y: sh * 0.1 };
+  tl = { ...tl, y: Math.min(tl.y, sh * 0.14) };
+  tr = { ...tr, y: Math.min(tr.y, sh * 0.14) };
+  tl = { ...tl, y: Math.max(minPinY, tl.y) };
+  tr = { ...tr, y: Math.max(minPinY, tr.y) };
+  bl = { ...bl, y: Math.min(maxFoulY, Math.max(bl.y, sh * 0.72)) };
+  br = { ...br, y: Math.min(maxFoulY, Math.max(br.y, sh * 0.72)) };
+  // pins 端至少保持合理頂寬（唔好夾死）
+  const minTopW = sw * 0.12;
+  if (tr.x - tl.x < minTopW) {
+    const mid = (tl.x + tr.x) / 2;
+    tl = { ...tl, x: mid - minTopW / 2 };
+    tr = { ...tr, x: mid + minTopW / 2 };
+  }
 
   // 映回原圖座標
   const inv = 1 / scale;
@@ -224,7 +243,9 @@ function nudgeEdge(
   sw: number,
   sh: number,
   p: Point2D,
-  side: -1 | 1
+  side: -1 | 1,
+  /** 外側偏好強度；pins 端宜細，避免 TL／TR 鎖進溝 */
+  outwardBias = 0.15
 ): Point2D {
   const y = Math.max(1, Math.min(sh - 2, Math.round(p.y)));
   const x0 = Math.max(2, Math.min(sw - 3, Math.round(p.x)));
@@ -235,8 +256,7 @@ function nudgeEdge(
     const x = x0 + dx;
     if (x < 1 || x >= sw - 1) continue;
     const g = Math.abs(gray[y * sw + x + 1] - gray[y * sw + x - 1]);
-    // 偏好外側（往 gutter）
-    const bias = side < 0 ? -dx * 0.15 : dx * 0.15;
+    const bias = side < 0 ? -dx * outwardBias : dx * outwardBias;
     const score = g + bias;
     if (score > bestG) {
       bestG = score;
