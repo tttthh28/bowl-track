@@ -4,6 +4,7 @@ import {
   estimateSegmentSpeedMph,
   estimateSpeedMph,
   feetAtMaxHook,
+  findActiveRollSpan,
   trajectoryCoverage,
 } from "./perspective";
 import type { EstimateExtrapolated, ShotEstimate, TrackPoint } from "./types";
@@ -68,6 +69,8 @@ export function computeShotEstimate(
   }
 
   // 球速：優先固定 feet 窗；若軌跡從中段開始則改用覆蓋相對區段
+  // 活躍滾動段（剪瓶口怠速）優先用於 launch／impact 邊界
+  const activeEarly = findActiveRollSpan(points);
   let launchSpeedMph = estimateSegmentSpeedMph(
     points,
     cov ? cov.minFeet : 0,
@@ -77,9 +80,39 @@ export function computeShotEstimate(
     const hi = cov.minFeet + Math.min(12, cov.span * 0.4);
     launchSpeedMph = estimateSegmentSpeedMph(points, cov.minFeet, hi);
   }
+  if (
+    launchSpeedMph == null &&
+    activeEarly &&
+    activeEarly.maxFeet - activeEarly.minFeet >= 6
+  ) {
+    const hi =
+      activeEarly.minFeet + (activeEarly.maxFeet - activeEarly.minFeet) * 0.4;
+    launchSpeedMph = estimateSegmentSpeedMph(
+      points,
+      activeEarly.minFeet,
+      hi
+    );
+  }
   let impactSpeedMph: number | null = null;
   if (cov) {
-    if (cov.maxFeet >= 40) {
+    // 優先：活躍段後 45%（避開瓶口怠速），其次固定 40′+
+    if (activeEarly && activeEarly.maxFeet - activeEarly.minFeet >= 8) {
+      const lo =
+        activeEarly.minFeet +
+        (activeEarly.maxFeet - activeEarly.minFeet) * 0.55;
+      impactSpeedMph = estimateSegmentSpeedMph(
+        points,
+        lo,
+        activeEarly.maxFeet
+      );
+      if (
+        impactSpeedMph != null &&
+        activeEarly.maxFeet < 50
+      ) {
+        extrapolated.impactSpeed = true;
+      }
+    }
+    if (impactSpeedMph == null && cov.maxFeet >= 40) {
       impactSpeedMph = estimateSegmentSpeedMph(
         points,
         40,
@@ -87,29 +120,40 @@ export function computeShotEstimate(
       );
     }
     if (impactSpeedMph == null && cov.span >= 8 && cov.maxFeet >= 14) {
-      // 覆蓋未到 40′，或 40′+ 區段估速失敗：用後段
       const lo = cov.minFeet + cov.span * 0.55;
       impactSpeedMph = estimateSegmentSpeedMph(points, lo, cov.maxFeet);
       if (impactSpeedMph != null) extrapolated.impactSpeed = true;
     }
   }
   let avgSpeedMph = estimateSpeedMph(points);
-  // 後備：覆蓋夠但滑窗失敗時，用整段淨 feet／時間
-  if (avgSpeedMph == null && cov && cov.span >= 8 && points.length >= 4) {
-    const usable = points.filter((p) => p.lane && !p.predicted);
-    if (usable.length >= 3) {
-      const t0 = usable[0].t;
-      const t1 = usable[usable.length - 1].t;
-      const dt = (t1 - t0) / 1000;
-      let path = 0;
-      for (let i = 1; i < usable.length; i++) {
-        const df = usable[i].lane!.feet - usable[i - 1].lane!.feet;
-        if (df > -0.4) path += Math.max(0, df);
-      }
-      if (dt >= 0.2 && path >= 6) {
-        const mph = path / dt / 1.4667;
-        if (mph >= 5 && mph <= 32) avgSpeedMph = Math.round(mph * 10) / 10;
-      }
+  const active = activeEarly;
+  // 後備：活躍滾動段 chord（唔用整段 lock→end，避免瓶口怠速拉低）
+  if (avgSpeedMph == null && active && active.dtSec >= 0.25) {
+    const mph = 0.65 * active.chordMph + 0.35 * active.pathMph;
+    if (mph >= 5 && mph <= 28) avgSpeedMph = Math.round(mph * 10) / 10;
+  }
+
+  // Impact：若後段估速明顯低於活躍平均（瓶口怠速），用活躍段後 40% chord 校正
+  if (
+    avgSpeedMph != null &&
+    active &&
+    active.dtSec >= 0.3 &&
+    cov &&
+    cov.span >= 8 &&
+    impactSpeedMph != null &&
+    impactSpeedMph < avgSpeedMph * 0.72
+  ) {
+    // 活躍段後段 feet 帶（避開瓶口怠速）
+    const lo = active.minFeet + (active.maxFeet - active.minFeet) * 0.55;
+    const hi = active.maxFeet;
+    const late = estimateSegmentSpeedMph(points, lo, hi);
+    if (late != null && late > impactSpeedMph) {
+      impactSpeedMph = late;
+      if (hi < 50) extrapolated.impactSpeed = true;
+    } else if (impactSpeedMph < avgSpeedMph * 0.65) {
+      // 仍然過低：用 avg 合理衰減（屋油常見），標區段——唔發明無依據高速
+      impactSpeedMph = Math.round(avgSpeedMph * 0.88 * 10) / 10;
+      extrapolated.impactSpeed = true;
     }
   }
 

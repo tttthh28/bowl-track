@@ -233,6 +233,11 @@ export function boardAtFeet(
 
 type TimedLane = { lane: LanePoint; t: number; predicted?: boolean };
 
+/** ft/s → mph */
+const FT_PER_SEC_PER_MPH = 1.4667;
+/** board 寬度（吋）：39 boards ≈ 41.5″ */
+const BOARD_INCHES = 41.5 / 39;
+
 function usableLanePoints(
   points: { lane?: LanePoint; t: number; predicted?: boolean }[]
 ): TimedLane[] {
@@ -248,18 +253,100 @@ function usableLanePoints(
   );
 }
 
+/** 輕量 Savitzky–Golay 風格：5 點二次平滑 feet（減噪，唔發明進度） */
+function smoothFeetSeries(usable: TimedLane[]): TimedLane[] {
+  if (usable.length < 5) return usable;
+  // 係數：二次多项式 window=5, derivative=0
+  const coeffs = [-3, 12, 17, 12, -3];
+  const norm = 35;
+  const out: TimedLane[] = usable.map((p) => ({
+    ...p,
+    lane: { ...p.lane },
+  }));
+  for (let i = 2; i < usable.length - 2; i++) {
+    let s = 0;
+    for (let k = -2; k <= 2; k++) s += coeffs[k + 2] * usable[i + k].lane.feet;
+    out[i].lane.feet = s / norm;
+  }
+  return out;
+}
+
+export type ActiveRollSpan = {
+  i0: number;
+  i1: number;
+  minFeet: number;
+  maxFeet: number;
+  dtSec: number;
+  /** 淨 feet 位移／時間 */
+  chordMph: number;
+  /** 含橫向 path 長度／時間 */
+  pathMph: number;
+};
+
 /**
- * 粗估球速：沿軌跡找「feet 進度最陡」的子窗／滑窗中位。
- * 1 mph ≈ 1.4667 ft/s。過濾預測點、回跳與鎖定前後靜止段。
+ * 活躍滾動段：剪掉鎖定前後／瓶口怠速（instant feet rate 過低）。
+ * 參考 TrueLine／bowling-cv：用真實前進時間，唔好用整段 lock→end。
  */
-export function estimateSpeedMph(
+export function findActiveRollSpan(
   points: { lane?: LanePoint; t: number; predicted?: boolean }[]
-): number | null {
-  const usable = usableLanePoints(points);
+): ActiveRollSpan | null {
+  const raw = usableLanePoints(points);
+  if (raw.length < 3) return null;
+  const usable = smoothFeetSeries(raw);
+
+  // 以時間序上「首次接近最高 feet」界定滾動結束，剪瓶口怠速
+  let peakFeet = usable[0].lane.feet;
+  let peakIdx = 0;
+  for (let i = 1; i < usable.length; i++) {
+    if (usable[i].lane.feet > peakFeet) {
+      peakFeet = usable[i].lane.feet;
+      peakIdx = i;
+    }
+  }
+  const startFeet = usable[0].lane.feet;
+  const span = peakFeet - startFeet;
+  if (span < 6 || peakIdx < 2) return null;
+
+  // 起點：累積前進超過 5% span；終點：首次達 90% span（或 peak）
+  const thrStart = startFeet + span * 0.05;
+  const thrEnd = startFeet + span * 0.9;
+  let i0 = 0;
+  while (i0 < peakIdx && usable[i0].lane.feet < thrStart) i0++;
+  let i1 = i0;
+  while (i1 < peakIdx && usable[i1].lane.feet < thrEnd) i1++;
+  i1 = Math.min(Math.max(i1, i0 + 2), peakIdx);
+
+  const df = usable[i1].lane.feet - usable[i0].lane.feet;
+  const dt = (usable[i1].t - usable[i0].t) / 1000;
+  if (df < 5 || dt < 0.15 || dt > 4) return null;
+
+  let path = 0;
+  for (let k = i0 + 1; k <= i1; k++) {
+    const ddf = usable[k].lane.feet - usable[k - 1].lane.feet;
+    const ddb = usable[k].lane.board - usable[k - 1].lane.board;
+    if (ddf > -0.4) {
+      path += Math.hypot(Math.max(0, ddf) * 12, ddb * BOARD_INCHES) / 12;
+    }
+  }
+  const chordMph = df / dt / FT_PER_SEC_PER_MPH;
+  const pathMph = path / dt / FT_PER_SEC_PER_MPH;
+  if (chordMph < 5 || chordMph > 32) return null;
+  return {
+    i0,
+    i1,
+    minFeet: usable[i0].lane.feet,
+    maxFeet: usable[i1].lane.feet,
+    dtSec: dt,
+    chordMph,
+    pathMph,
+  };
+}
+
+/** 子窗估速：全軌跡多窗長，先濾怠速窗再取中高分位 */
+function windowSpeedMph(usable: TimedLane[]): number | null {
   if (usable.length < 3) return null;
 
   const windows: number[] = [];
-  // 多種窗長：捕捉真實滾動段，避開鎖定前後慢漂
   const spans = [
     Math.max(2, Math.floor(usable.length / 8)),
     Math.max(3, Math.floor(usable.length / 5)),
@@ -268,31 +355,123 @@ export function estimateSpeedMph(
   for (const span of spans) {
     for (let i = 0; i + span < usable.length; i++) {
       const j = i + span;
-      const a = usable[i];
-      const b = usable[j];
-      const dt = (b.t - a.t) / 1000;
+      const dt = (usable[j].t - usable[i].t) / 1000;
       if (dt < 0.05 || dt > 4) continue;
       let path = 0;
       for (let k = i + 1; k <= j; k++) {
         const df = usable[k].lane.feet - usable[k - 1].lane.feet;
-        if (df > -0.4) path += Math.max(0, df);
+        const db = usable[k].lane.board - usable[k - 1].lane.board;
+        if (df > -0.4) {
+          path += Math.hypot(Math.max(0, df) * 12, db * BOARD_INCHES) / 12;
+        }
       }
-      if (path < 0.5) continue;
-      const mph = path / dt / 1.4667;
-      // 真球常見 10–22；允許 6–32，濾極端慢漂／噪聲跳點
-      if (mph >= 5 && mph <= 32) windows.push(mph);
+      if (path < 1.0) continue;
+      const mph = path / dt / FT_PER_SEC_PER_MPH;
+      // 丟棄明顯怠速窗，避免拉低分位
+      if (mph >= 8 && mph <= 28) windows.push(mph);
     }
   }
-
-  if (windows.length >= 1) {
-    windows.sort((a, b) => a - b);
-    // 取較高分位，偏向真實滾動而非慢漂中位
-    const idx = Math.min(
-      windows.length - 1,
-      Math.max(0, Math.floor(windows.length * 0.7))
-    );
-    return Math.round(windows[idx] * 10) / 10;
+  if (windows.length < 1) {
+    // 放寬：允許 5–32
+    for (const span of spans) {
+      for (let i = 0; i + span < usable.length; i++) {
+        const j = i + span;
+        const dt = (usable[j].t - usable[i].t) / 1000;
+        if (dt < 0.05 || dt > 4) continue;
+        let path = 0;
+        for (let k = i + 1; k <= j; k++) {
+          const df = usable[k].lane.feet - usable[k - 1].lane.feet;
+          if (df > -0.4) path += Math.max(0, df);
+        }
+        if (path < 0.5) continue;
+        const mph = path / dt / FT_PER_SEC_PER_MPH;
+        if (mph >= 5 && mph <= 32) windows.push(mph);
+      }
+    }
   }
+  if (windows.length < 1) return null;
+  windows.sort((a, b) => a - b);
+  const idx = Math.min(
+    windows.length - 1,
+    Math.max(0, Math.floor(windows.length * 0.72))
+  );
+  return windows[idx];
+}
+
+/**
+ * 融合子窗估速 + 活躍段 chord／path。
+ * 透視跳點時 chord 會虛高 → 以子窗為主；子窗被怠速拉低 → 輕微上拉。
+ * 雙方失敗 → null（—，唔假報）。
+ */
+function fuseSpeedEstimates(
+  windowMph: number | null,
+  active: ActiveRollSpan | null
+): number | null {
+  // chord soft-cap：屋局／透視壓縮下 >22 多半係映射誤差
+  let chord: number | null = null;
+  if (active != null) {
+    chord = 0.75 * active.chordMph + 0.25 * active.pathMph;
+    if (chord > 22) chord = 18 + (chord - 22) * 0.15; // 軟壓到 ~18–20
+    if (chord > 20) chord = 20;
+  }
+
+  let laneScale: number | null = null;
+  if (
+    active &&
+    active.minFeet <= 6 &&
+    active.maxFeet >= 54 &&
+    active.dtSec >= 0.8 &&
+    active.dtSec <= 4.5
+  ) {
+    const fullMph = LANE_L / active.dtSec / FT_PER_SEC_PER_MPH;
+    if (fullMph >= 10 && fullMph <= 22) laneScale = fullMph;
+  }
+
+  if (windowMph == null && chord == null) {
+    return laneScale != null ? Math.round(laneScale * 10) / 10 : null;
+  }
+  if (windowMph == null) {
+    return Math.round((chord ?? laneScale)! * 10) / 10;
+  }
+  if (chord == null) {
+    let w = windowMph;
+    if (laneScale != null) w = 0.9 * w + 0.1 * laneScale;
+    return Math.round(w * 10) / 10;
+  }
+
+  const w = windowMph;
+  const c = chord;
+  let fused: number;
+  if (c > w * 1.25) {
+    // 活躍 chord 偏高（透視）：子窗為主，最多上拉 ~12%
+    fused = w * 1.08;
+    if (c < w * 1.5) fused = 0.82 * w + 0.18 * c;
+  } else if (w < 12.5 && c >= 13 && c <= 20) {
+    fused = 0.45 * w + 0.55 * c;
+  } else {
+    fused = 0.6 * w + 0.4 * c;
+  }
+  if (laneScale != null) fused = 0.9 * fused + 0.1 * laneScale;
+  // 合理保齡顯示範圍；超過仍回傳但 clamp 防假報極端
+  if (fused < 5) return Math.round(w * 10) / 10;
+  if (fused > 24) fused = 0.7 * w + 0.3 * 18;
+  return Math.round(fused * 10) / 10;
+}
+
+/**
+ * 粗估球速：子窗 + 活躍滾動段距離／時間融合。
+ * 1 mph ≈ 1.4667 ft/s。過濾預測點、回跳與鎖定前後／瓶口怠速。
+ */
+export function estimateSpeedMph(
+  points: { lane?: LanePoint; t: number; predicted?: boolean }[]
+): number | null {
+  const raw = usableLanePoints(points);
+  if (raw.length < 3) return null;
+  const usable = smoothFeetSeries(raw);
+  const windowMph = windowSpeedMph(usable);
+  const active = findActiveRollSpan(points);
+  const fused = fuseSpeedEstimates(windowMph, active);
+  if (fused != null) return fused;
 
   // 後備：只取 feet 單調上升最快的連續段
   let bestMph: number | null = null;
@@ -308,7 +487,7 @@ export function estimateSpeedMph(
       if (path >= 3) {
         const dt = (usable[j - 1].t - usable[i].t) / 1000;
         if (dt >= 0.08) {
-          const mph = path / dt / 1.4667;
+          const mph = path / dt / FT_PER_SEC_PER_MPH;
           if (mph >= 5 && mph <= 32) {
             if (bestMph == null || mph > bestMph) bestMph = mph;
           }
@@ -339,7 +518,7 @@ export function defaultCorners(
 }
 
 /**
- * 區段球速：只取 feet 落在 [feetLo, feetHi] 的點。
+ * 區段球速：只取 feet 落在 [feetLo, feetHi] 的點；剪怠速後子窗＋chord 融合。
  * 覆蓋不足時回 null（不硬填）。
  */
 export function estimateSegmentSpeedMph(
@@ -349,42 +528,68 @@ export function estimateSegmentSpeedMph(
 ): number | null {
   const cov = trajectoryCoverage(points);
   if (!cov) return null;
-  // 區段與覆蓋要有足夠重疊
   const overlapLo = Math.max(feetLo, cov.minFeet);
   const overlapHi = Math.min(feetHi, cov.maxFeet);
   if (overlapHi - overlapLo < 1.5) return null;
 
-  const usable = usableLanePoints(points).filter(
+  const usable = smoothFeetSeries(
+    usableLanePoints(points).filter(
+      (p) => p.lane.feet >= overlapLo - 0.5 && p.lane.feet <= overlapHi + 0.5
+    )
+  ).filter(
     (p) => p.lane.feet >= overlapLo && p.lane.feet <= overlapHi
   );
   if (usable.length < 2) return null;
 
-  // 優先：區段內最陡子窗
-  const segWindows: number[] = [];
-  const span = Math.max(1, Math.floor(usable.length / 4));
-  for (let i = 0; i + span < usable.length; i++) {
-    const j = Math.min(usable.length - 1, i + span);
-    const dt = (usable[j].t - usable[i].t) / 1000;
-    if (dt < 0.04 || dt > 3) continue;
-    let path = 0;
-    for (let k = i + 1; k <= j; k++) {
-      const df = usable[k].lane.feet - usable[k - 1].lane.feet;
-      if (df > -0.4) path += Math.max(0, df);
+  const windowMph = windowSpeedMph(usable);
+
+  // 區段內活躍 chord（剪即時速率過低）
+  let i0 = 0;
+  let i1 = usable.length - 1;
+  for (let i = 1; i < usable.length; i++) {
+    const dt = (usable[i].t - usable[i - 1].t) / 1000;
+    const df = usable[i].lane.feet - usable[i - 1].lane.feet;
+    const mph = dt >= 0.02 ? Math.max(0, df) / dt / FT_PER_SEC_PER_MPH : 0;
+    if (mph >= 3) {
+      i0 = Math.max(0, i - 1);
+      break;
     }
-    if (path < 0.5) continue;
-    const mph = path / dt / 1.4667;
-    if (mph >= 5 && mph <= 32) segWindows.push(mph);
   }
-  if (segWindows.length >= 1) {
-    segWindows.sort((a, b) => a - b);
-    const idx = Math.min(
-      segWindows.length - 1,
-      Math.floor(segWindows.length * 0.7)
-    );
-    return Math.round(segWindows[idx] * 10) / 10;
+  for (let i = usable.length - 1; i >= 1; i--) {
+    const dt = (usable[i].t - usable[i - 1].t) / 1000;
+    const df = usable[i].lane.feet - usable[i - 1].lane.feet;
+    const mph = dt >= 0.02 ? Math.max(0, df) / dt / FT_PER_SEC_PER_MPH : 0;
+    if (mph >= 3) {
+      i1 = i;
+      break;
+    }
+  }
+  let chord: number | null = null;
+  if (i1 > i0) {
+    const df = usable[i1].lane.feet - usable[i0].lane.feet;
+    const dt = (usable[i1].t - usable[i0].t) / 1000;
+    if (df >= 1.2 && dt >= 0.08 && dt <= 3) {
+      const c = df / dt / FT_PER_SEC_PER_MPH;
+      if (c >= 5 && c <= 32) chord = c;
+    }
   }
 
-  // 後備：同 estimateSpeedMph，取區段內最陡子窗而非整段平均（整段常被慢頭尾拉低）
+  const fused = fuseSpeedEstimates(
+    windowMph,
+    chord != null && i1 > i0
+      ? {
+          i0,
+          i1,
+          minFeet: usable[i0].lane.feet,
+          maxFeet: usable[i1].lane.feet,
+          dtSec: (usable[i1].t - usable[i0].t) / 1000,
+          chordMph: chord,
+          pathMph: chord,
+        }
+      : null
+  );
+  if (fused != null) return fused;
+
   let bestMph: number | null = null;
   for (let i = 0; i < usable.length - 2; i++) {
     for (let j = i + 2; j < usable.length; j++) {
@@ -396,7 +601,7 @@ export function estimateSegmentSpeedMph(
         if (df > -0.4) path2 += Math.max(0, df);
       }
       if (path2 < 1.2) continue;
-      const mph2 = path2 / dt2 / 1.4667;
+      const mph2 = path2 / dt2 / FT_PER_SEC_PER_MPH;
       if (mph2 >= 5 && mph2 <= 32) {
         if (bestMph == null || mph2 > bestMph) bestMph = mph2;
       }

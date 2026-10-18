@@ -9,7 +9,8 @@
     "lint": "next lint",
     "verify:tracker": "tsx scripts/verify-tracker-run.mts",
     "db:push": "drizzle-kit push",
-    "db:studio": "drizzle-kit studio"
+    "db:studio": "drizzle-kit studio",
+    "score:accuracy": "tsx scripts/score-accuracy.mts"
   },
   "dependencies": {
     "@neondatabase/serverless": "^1.2.0",
