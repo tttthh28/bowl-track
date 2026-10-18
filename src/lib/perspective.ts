@@ -165,3 +165,65 @@ export function defaultCorners(
     bl: { x: botM, y: botY },
   };
 }
+
+/**
+ * 區段球速：只取 feet 落在 [feetLo, feetHi] 的點。
+ */
+export function estimateSegmentSpeedMph(
+  points: { lane?: LanePoint; t: number }[],
+  feetLo: number,
+  feetHi: number
+): number | null {
+  const usable = points.filter(
+    (p) =>
+      p.lane &&
+      p.t >= 0 &&
+      p.lane.feet >= feetLo &&
+      p.lane.feet <= feetHi
+  );
+  if (usable.length < 3) return null;
+  const first = usable[0];
+  const last = usable[usable.length - 1];
+  const dt = (last.t - first.t) / 1000;
+  if (dt < 0.08) return null;
+  const df = Math.abs(last.lane!.feet - first.lane!.feet);
+  if (df < 2) return null;
+  const mph = df / dt / 1.4667;
+  if (mph < 3 || mph > 40) return null;
+  return Math.round(mph * 10) / 10;
+}
+
+/**
+ * 找 hook 最大處（board 變化相對 feet 的轉折）：
+ * 簡化為箭頭之後、袋口之前，board 對 feet 二階差分最大處；失敗回 42。
+ */
+export function feetAtMaxHook(
+  points: { lane?: LanePoint }[]
+): number | null {
+  const withLane = points
+    .filter((p) => p.lane)
+    .map((p) => p.lane!)
+    .filter((p) => p.feet >= 12 && p.feet <= 52);
+  if (withLane.length < 6) return 42;
+
+  // 重採樣到等距 feet
+  const samples: { feet: number; board: number }[] = [];
+  for (let f = 15; f <= 48; f += 2) {
+    const b = boardAtFeet(points, f);
+    if (b != null) samples.push({ feet: f, board: b });
+  }
+  if (samples.length < 5) return 42;
+
+  let bestFeet = 42;
+  let bestCurv = -1;
+  for (let i = 1; i < samples.length - 1; i++) {
+    const d1 = samples[i].board - samples[i - 1].board;
+    const d2 = samples[i + 1].board - samples[i].board;
+    const curv = Math.abs(d2 - d1);
+    if (curv > bestCurv) {
+      bestCurv = curv;
+      bestFeet = samples[i].feet;
+    }
+  }
+  return bestFeet;
+}

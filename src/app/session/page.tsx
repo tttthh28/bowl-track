@@ -18,7 +18,7 @@ export default function SessionPage() {
             </h1>
           </div>
           <span className="rounded-full bg-slate-800 px-2.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-slate-400">
-            MVP
+            v0.2
           </span>
         </div>
       </header>

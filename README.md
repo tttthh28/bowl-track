@@ -1,6 +1,6 @@
-# Bowl Track — 保齡球球路追蹤 MVP
+# Bowl Track — 保齡球球路追蹤
 
-瀏覽器端精簡版球路追蹤（類似 LaneTrax 概念）：Next.js App Router + TypeScript，追球使用純 Canvas／ImageData 幀差，無需 TensorFlow。
+瀏覽器端球路追蹤（類似 LaneTrax 概念）：Next.js App Router + TypeScript，追球使用純 Canvas／ImageData，無需 TensorFlow。
 
 ## 本機啟動
 
@@ -19,53 +19,65 @@ npm run build
 npm start
 ```
 
-> 手機鏡頭需在 **HTTPS** 或 `localhost` 下使用 `getUserMedia`。若用區網 IP 測手機，請自行設定 HTTPS 或用瀏覽器旗標／隧道。
+> 手機鏡頭需在 **HTTPS** 或 `localhost` 下使用 `getUserMedia`。
 
 ## 用法
 
 1. 首頁按「開始追蹤」進入 `/session`
-2. **開啟鏡頭**（優先後置 `facingMode: environment`）或 **上傳影片**
-3. 拖曳畫面四個藍點，對準球道四角（預設後方視角）：
+2. **開啟鏡頭**（優先後置）或 **上傳影片**——鏡頭需見到 **foul～pins**
+3. 按 **自動偵測球道**，或拖曳四個藍點對準四角：
    - **TL / TR**（上）：pin deck 左／右
    - **BL / BR**（下）：foul line 左／右
-4. 調整「追蹤靈敏度」後按 **開始追蹤**
-5. 投球；軌跡疊在影片上，側欄球道圖同步更新
-6. 球消失約十餘幀後自動結束一投，粗估寫入本局（localStorage）
+4. 調整靈敏度（可開「自動微調」）後按 **開始追蹤**
+5. 投球；軌跡疊在影片上（黃點＝預測幀），側欄同步更新
+6. 球消失約十餘幀後自動結束一投並寫入本局（localStorage）
 
 ## 已實作功能
 
 - 即時鏡頭／影片上傳
-- 可拖曳四角標定 + 透視變換（影像 → 0–39 boards × 0–60 feet）
-- 灰階幀差 + 最大 blob 質心追球；可調閾值與最小 blob
-- 影片疊軌跡 + 2D 球道圖（簡化 39 boards）
-- 粗估：箭頭區（≈15′）、breakpoint（≈42′）、進袋（≈58′）board；可選粗球速 mph
+- **自動偵測球道四角**（亮區／梯形邊緣擬合）＋手動拖曳後備
+- 透視變換（影像 → 0–39 boards × 0–60 feet）
+- **穩健追球**：背景模型＋球道多邊形 ROI＋幀差融合、EMA 平滑、丟幀預測、自動閾值、偏好預測鄰近 blob
+- 影片疊軌跡 + 2D 球道圖
+- 指標：Foul／Arrows／Entry、Breakpoint board＋distance、Launch／Impact 角、Launch／Impact／Avg 球速、Hook boards／Hook factor（簡化）、Shot time
+- **實驗性 RPM**：球表極座標循環相關估角速度；UI 標實驗／信心；可調對比門檻
 - 球局存 localStorage；清除投球／新球局
 - 繁中 UI、手機 viewport
 
+## 指標怎麼算（簡述）
+
+| 指標 | 算法 |
+|------|------|
+| Foul / Arrows / Pocket board | 軌跡在 ≈1′ / 15′ / 58′ 的 board 線性插值 |
+| Breakpoint | 15′–48′ 間 board 對 feet 曲率最大處（失敗則 42′） |
+| Launch / Impact 角 | 區段 Δboard／Δfeet 轉成相對中線角度（度） |
+| Launch / Impact / Avg 速 | 區段或全程 feet／時間 → mph |
+| Hook boards | Foul（或 Arrows）board − BP board |
+| Hook factor | \|hook\| / (BP feet − 15′) |
+| Shot time | 首末有效軌跡點時間差 |
+| RPM（實驗） | 球周環帶極座標強度條幀間循環相關 → deg/s → RPM |
+
+## RPM 限制
+
+- 需球表**高對比色塊／標記**；素色球幾乎無解
+- 模糊、曝光、遮擋會讓信心偏低；UI 顯示「低信心」時勿当真
+- 估的是影像角自旋投影，非正式陀螺／雷達 RPM
+- 進階面板可關 RPM 或調「對比門檻」
+
 ## 已知限制
 
-- 光線不足、球與球道對比低、或相機大幅晃動時易丟球／誤追
-- 需手動四角；四角標歪會讓 board／球速偏差很大
-- 幀差會把「任何移動物」當候選，背景有人走過可能干擾
-- 球速為路徑 feet／時間粗估，非正式雷達測速
-- 資料僅存於該瀏覽器，清除網站資料即消失
-- 未做多球道／計分／雲端同步
-
-## 技術摘要
-
-| 項目 | 說明 |
-|------|------|
-| 框架 | Next.js 14（App Router）、React 18、TypeScript、Tailwind |
-| 追球 | `getImageData` → 灰階差 → 閾值 → 4-連通最大 blob |
-| 座標 | 四點透視（homography）映射到簡化球道 |
-| 儲存 | `localStorage` key `bowl-track-sessions-v1` |
+- 自動偵測依賴亮球道與後方梯形視角；暗館／側拍易失敗 → 改手動
+- 相機大幅晃動仍可能誤觸（背景模型可緩解）
+- 球速／角度／Hook 為路徑粗估
+- 資料僅存該瀏覽器
+- 未做多球道／計分／雲端
 
 ## 建議試用步驟（Tony）
 
 1. `cd /workspace/bowl-track && npm run dev`
-2. 用桌上型機先上傳一段側／後方球道短片驗證四角與軌跡
-3. 手機連同一 `localhost` 隧道或 HTTPS 後測後置鏡頭
-4. 若雜訊多：把靈敏度調到 35–50，並加大「最小 blob」
-5. 確認側欄袋口 board 與肉眼大致同向後，再連投數球看 localStorage 累積
+2. 上傳後方 foul～pins 短片 → **自動偵測** → 微調藍點 → **開始追蹤**
+3. 雜訊多：開「自動微調」、靈敏度 35–50、加大最小 blob；進階可降背景學習率
+4. 測 RPM：球上貼清晰對比標，進階開啟 RPM，看信心標籤
+5. 確認側欄指標後連投數球看 localStorage 累積
 
-本專案刻意不 push、不部署。
+本專案刻意不 push、不部署（等明確「做」）。

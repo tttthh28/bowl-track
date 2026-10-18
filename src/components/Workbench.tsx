@@ -16,10 +16,15 @@ import {
 } from "@/lib/perspective";
 import { computeShotEstimate } from "@/lib/estimates";
 import {
-  cornersBBox,
+  detectLaneFromCanvas,
+  fallbackDefaultCorners,
+} from "@/lib/laneDetect";
+import {
+  BallTrackerState,
   DEFAULT_TRACKER,
-  findBallCentroid,
+  getRpmEstimate,
   rgbaToGray,
+  trackBallFrame,
 } from "@/lib/tracker";
 import {
   appendShot,
@@ -56,10 +61,10 @@ export default function Workbench() {
   const overlayRef = useRef<HTMLCanvasElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const rafRef = useRef<number>(0);
-  const prevGrayRef = useRef<Uint8ClampedArray | null>(null);
+  const trackerRef = useRef(new BallTrackerState());
   const trackingRef = useRef(false);
-  const lostRef = useRef(0);
   const shotStartRef = useRef<number>(0);
+  const lastFrameTRef = useRef<number>(0);
   const livePointsRef = useRef<TrackPoint[]>([]);
   const cornersRef = useRef<LaneCorners | null>(null);
   const homoRef = useRef<Homography | null>(null);
@@ -80,8 +85,11 @@ export default function Workbench() {
   const [status, setStatus] = useState("請開啟鏡頭或上傳影片");
   const [videoReady, setVideoReady] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [detectMsg, setDetectMsg] = useState<string | null>(null);
+  const [detecting, setDetecting] = useState(false);
+  const [showAdvanced, setShowAdvanced] = useState(false);
+  const [debugNoise, setDebugNoise] = useState<number | null>(null);
 
-  // 同步 refs
   useEffect(() => {
     cornersRef.current = corners;
     homoRef.current = corners ? buildHomography(corners) : null;
@@ -96,11 +104,11 @@ export default function Workbench() {
     sourceModeRef.current = sourceMode;
   }, [sourceMode]);
 
-  // 初始化 session
   useEffect(() => {
-    const existing = typeof window !== "undefined"
-      ? localStorage.getItem("bowl-track-active-session")
-      : null;
+    const existing =
+      typeof window !== "undefined"
+        ? localStorage.getItem("bowl-track-active-session")
+        : null;
     if (existing) {
       const s = getSession(existing);
       if (s) {
@@ -115,18 +123,15 @@ export default function Workbench() {
     setSession(s);
   }, []);
 
-  const persistCorners = useCallback(
-    (c: LaneCorners) => {
-      setCorners(c);
-      setSession((prev) => {
-        if (!prev) return prev;
-        const next = { ...prev, corners: c };
-        saveSession(next);
-        return next;
-      });
-    },
-    []
-  );
+  const persistCorners = useCallback((c: LaneCorners) => {
+    setCorners(c);
+    setSession((prev) => {
+      if (!prev) return prev;
+      const next = { ...prev, corners: c };
+      saveSession(next);
+      return next;
+    });
+  }, []);
 
   const stopCamera = useCallback(() => {
     if (streamRef.current) {
@@ -141,13 +146,64 @@ export default function Workbench() {
     const c = defaultCorners(v.videoWidth, v.videoHeight);
     persistCorners(c);
     setPhase("calibrate");
-    setStatus("請拖曳四角對準球道，完成後按「開始追蹤」");
+    setDetectMsg(null);
+    setStatus("請拖曳四角或按「自動偵測」；鏡頭需見到 foul～pins");
   }, [persistCorners]);
 
   const onVideoReady = useCallback(() => {
     setVideoReady(true);
     initCornersFromVideo();
   }, [initCornersFromVideo]);
+
+  const grabFrameToCanvas = useCallback((): HTMLCanvasElement | null => {
+    const v = videoRef.current;
+    const canvas = canvasRef.current;
+    if (!v || !canvas || !v.videoWidth) return null;
+    const w = v.videoWidth;
+    const h = v.videoHeight;
+    if (canvas.width !== w || canvas.height !== h) {
+      canvas.width = w;
+      canvas.height = h;
+    }
+    const ctx = canvas.getContext("2d", { willReadFrequently: true });
+    if (!ctx) return null;
+    ctx.drawImage(v, 0, 0, w, h);
+    return canvas;
+  }, []);
+
+  const runAutoDetect = useCallback(() => {
+    setError(null);
+    setDetecting(true);
+    setDetectMsg(null);
+    try {
+      const canvas = grabFrameToCanvas();
+      const v = videoRef.current;
+      if (!canvas || !v?.videoWidth) {
+        setError("尚無影像，請先開啟鏡頭或上傳影片");
+        return;
+      }
+      const result = detectLaneFromCanvas(canvas);
+      if (!result) {
+        const fb = fallbackDefaultCorners(v.videoWidth, v.videoHeight);
+        persistCorners(fb);
+        setDetectMsg("自動偵測失敗，已退回預設四角，請手動拖曳");
+        setStatus("自動偵測失敗 → 請手動對準 foul～pins");
+        return;
+      }
+      persistCorners(result.corners);
+      setDetectMsg(
+        `${result.message}（信心 ${(result.confidence * 100).toFixed(0)}%）`
+      );
+      setStatus(
+        result.confidence >= 0.55
+          ? "自動偵測完成，可微調藍點後開始追蹤"
+          : "自動偵測信心偏低，建議手動調整四角"
+      );
+      setPhase("calibrate");
+    } finally {
+      setDetecting(false);
+    }
+  }, [grabFrameToCanvas, persistCorners]);
 
   const startCamera = async () => {
     setError(null);
@@ -170,7 +226,6 @@ export default function Workbench() {
       await v.play();
       setSourceMode("camera");
       setStatus("鏡頭已開啟");
-      // loadedmetadata may already have fired
       if (v.videoWidth) onVideoReady();
     } catch (e) {
       setError(
@@ -205,7 +260,6 @@ export default function Workbench() {
     }
   };
 
-  // 繪製 overlay（四角 + 軌跡）
   const drawOverlay = useCallback(() => {
     const v = videoRef.current;
     const overlay = overlayRef.current;
@@ -265,7 +319,7 @@ export default function Workbench() {
       const last = pts[pts.length - 1];
       ctx.beginPath();
       ctx.arc(last.image.x, last.image.y, 8, 0, Math.PI * 2);
-      ctx.fillStyle = "#f97316";
+      ctx.fillStyle = last.predicted ? "#fbbf24" : "#f97316";
       ctx.fill();
     }
   }, []);
@@ -273,13 +327,16 @@ export default function Workbench() {
   const finishShot = useCallback(() => {
     const points = [...livePointsRef.current];
     livePointsRef.current = [];
-    lostRef.current = 0;
+    trackerRef.current.lost = 0;
     if (points.length < 5) {
       setLivePath([]);
       setStatus("軌跡太短，已忽略（請調靈敏度或確認四角）");
+      trackerRef.current.prevPolar = null;
+      trackerRef.current.rpmSamples = [];
       return;
     }
-    const estimate = computeShotEstimate(points);
+    const rpm = getRpmEstimate(trackerRef.current);
+    const estimate = computeShotEstimate(points, rpm);
     const shot: Shot = {
       id: `shot_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
       createdAt: Date.now(),
@@ -294,14 +351,28 @@ export default function Workbench() {
       const updated = appendShot(prev.id, shot);
       return updated ?? { ...prev, shots: [...prev.shots, shot] };
     });
+    const rpmTxt =
+      estimate.rpm != null
+        ? ` · RPM ${estimate.rpm}（實驗）`
+        : "";
     setStatus(
-      `已存一投 · 袋口 board ${
+      `已存一投 · 袋口 ${
         estimate.pocketBoard?.toFixed(1) ?? "—"
-      } · ${estimate.speedMph != null ? estimate.speedMph + " mph" : "無球速"}`
+      } · ${
+        estimate.avgSpeedMph != null
+          ? estimate.avgSpeedMph + " mph"
+          : "無球速"
+      }${rpmTxt}`
     );
+    // 保留背景，清 RPM 樣本供下一投
+    trackerRef.current.prevPolar = null;
+    trackerRef.current.rpmSamples = [];
+    trackerRef.current.lastRpm = null;
+    trackerRef.current.lastRpmConf = 0;
+    trackerRef.current.ema = null;
+    trackerRef.current.vel = { x: 0, y: 0 };
   }, []);
 
-  // 主迴圈
   useEffect(() => {
     const loop = () => {
       rafRef.current = requestAnimationFrame(loop);
@@ -323,47 +394,66 @@ export default function Workbench() {
       ctx.drawImage(v, 0, 0, w, h);
 
       if (trackingRef.current && cornersRef.current) {
+        const now = performance.now();
+        const dt =
+          lastFrameTRef.current > 0
+            ? Math.min(80, now - lastFrameTRef.current)
+            : 33;
+        lastFrameTRef.current = now;
+
         const frame = ctx.getImageData(0, 0, w, h);
         const gray = rgbaToGray(frame.data, w, h);
-        const prev = prevGrayRef.current;
-        if (prev && prev.length === gray.length) {
-          const roi = cornersBBox(cornersRef.current, 12);
-          const centroid = findBallCentroid(
-            gray,
-            prev,
-            w,
-            h,
-            settingsRef.current,
-            roi
-          );
-          if (centroid) {
-            lostRef.current = 0;
-            if (livePointsRef.current.length === 0) {
-              shotStartRef.current = performance.now();
-            }
+        const result = trackBallFrame(
+          trackerRef.current,
+          gray,
+          w,
+          h,
+          settingsRef.current,
+          cornersRef.current,
+          dt
+        );
+
+        if (livePointsRef.current.length % 10 === 0) {
+          setDebugNoise(Math.round(result.noiseLevel));
+        }
+
+        const pos = result.smoothed;
+        if (pos) {
+          if (livePointsRef.current.length === 0 && !result.predicted) {
+            shotStartRef.current = performance.now();
+          }
+          if (livePointsRef.current.length > 0 || !result.predicted) {
             const t = performance.now() - shotStartRef.current;
             const H = homoRef.current;
-            const lane = H ? imageToLane(H, centroid) : undefined;
-            const tp: TrackPoint = { image: centroid, lane, t };
+            const lane = H ? imageToLane(H, pos) : undefined;
+            const tp: TrackPoint = {
+              image: pos,
+              lane,
+              t,
+              predicted: result.predicted || undefined,
+            };
             livePointsRef.current.push(tp);
-            // 節流更新 UI
             if (livePointsRef.current.length % 3 === 0) {
               const path = livePointsRef.current
                 .filter((p) => p.lane)
                 .map((p) => p.lane!);
               setLivePath(path);
-              setLiveEstimate(computeShotEstimate(livePointsRef.current));
-            }
-          } else if (livePointsRef.current.length > 0) {
-            lostRef.current += 1;
-            if (lostRef.current >= settingsRef.current.lostFramesToEnd) {
-              finishShot();
+              const rpm = getRpmEstimate(trackerRef.current);
+              setLiveEstimate(
+                computeShotEstimate(livePointsRef.current, rpm)
+              );
             }
           }
         }
-        prevGrayRef.current = gray;
+
+        if (
+          trackerRef.current.lost >= settingsRef.current.lostFramesToEnd &&
+          livePointsRef.current.length > 0
+        ) {
+          finishShot();
+        }
       } else {
-        prevGrayRef.current = null;
+        lastFrameTRef.current = 0;
       }
 
       drawOverlay();
@@ -372,7 +462,6 @@ export default function Workbench() {
     return () => cancelAnimationFrame(rafRef.current);
   }, [drawOverlay, finishShot]);
 
-  // 角點拖曳
   const clientToVideo = (clientX: number, clientY: number): Point2D | null => {
     const overlay = overlayRef.current;
     if (!overlay) return null;
@@ -445,13 +534,13 @@ export default function Workbench() {
       return;
     }
     livePointsRef.current = [];
-    lostRef.current = 0;
-    prevGrayRef.current = null;
+    trackerRef.current.reset();
+    lastFrameTRef.current = 0;
     setLivePath([]);
     setLiveEstimate(null);
     setPhase("track");
     setTracking(true);
-    setStatus("追蹤中…球通過後會自動存檔");
+    setStatus("追蹤中…球通過後會自動存檔（黃點＝預測幀）");
   };
 
   const stopTracking = () => {
@@ -488,6 +577,7 @@ export default function Workbench() {
     setLiveEstimate(null);
     setVideoReady(false);
     setSourceMode("idle");
+    setDetectMsg(null);
     stopCamera();
     const v = videoRef.current;
     if (v) {
@@ -506,7 +596,6 @@ export default function Workbench() {
 
   return (
     <div className="mx-auto flex max-w-6xl flex-col gap-4 px-3 py-4 pb-24 md:pb-8">
-      {/* 工具列 */}
       <div className="flex flex-wrap items-center gap-2">
         <button
           type="button"
@@ -524,6 +613,14 @@ export default function Workbench() {
             onChange={(e) => onFile(e.target.files?.[0] ?? null)}
           />
         </label>
+        <button
+          type="button"
+          onClick={runAutoDetect}
+          disabled={!videoReady || tracking || detecting}
+          className="rounded-lg bg-emerald-700 px-3 py-2 text-sm font-medium text-white hover:bg-emerald-600 disabled:cursor-not-allowed disabled:opacity-40"
+        >
+          {detecting ? "偵測中…" : "自動偵測球道"}
+        </button>
         {!tracking ? (
           <button
             type="button"
@@ -563,6 +660,11 @@ export default function Workbench() {
           {error}
         </div>
       )}
+      {detectMsg && (
+        <div className="rounded-lg border border-emerald-800/50 bg-emerald-950/40 px-3 py-2 text-sm text-emerald-200">
+          {detectMsg}
+        </div>
+      )}
 
       <p className="text-sm text-slate-400">
         {status}
@@ -571,8 +673,7 @@ export default function Workbench() {
         )}
       </p>
 
-      <div className="grid gap-4 lg:grid-cols-[1fr_240px]">
-        {/* 影片區 */}
+      <div className="grid gap-4 lg:grid-cols-[1fr_260px]">
         <div className="space-y-3">
           <div
             className="relative overflow-hidden rounded-xl border border-slate-700 bg-black"
@@ -597,16 +698,20 @@ export default function Workbench() {
             {!videoReady && (
               <div className="absolute inset-0 flex items-center justify-center bg-slate-950/80 p-6 text-center text-sm text-slate-400">
                 開啟手機後置鏡頭，或上傳球道側面／後方影片
+                <br />
+                （鏡頭需見到 foul line～pins，參考 LaneTrax）
               </div>
             )}
           </div>
 
-          {/* 靈敏度 */}
           <div className="rounded-xl border border-slate-700 bg-slate-900/80 p-3">
             <div className="mb-2 flex items-center justify-between text-sm">
               <span className="font-medium text-slate-200">追蹤靈敏度</span>
               <span className="font-mono text-slate-400">
                 {settings.sensitivity}
+                {settings.autoSensitivity && debugNoise != null
+                  ? ` · 雜訊≈${debugNoise}`
+                  : ""}
               </span>
             </div>
             <input
@@ -622,25 +727,129 @@ export default function Workbench() {
               }
               className="w-full accent-sky-500"
             />
-            <p className="mt-1 text-[11px] text-slate-500">
-              數值越低越敏感（雜訊多時調高）。最小 blob：
-              <input
-                type="number"
-                min={10}
-                max={500}
-                value={settings.minBlobPixels}
-                onChange={(e) =>
-                  setSettings((s) => ({
-                    ...s,
-                    minBlobPixels: Number(e.target.value) || 40,
-                  }))
-                }
-                className="ml-1 w-14 rounded border border-slate-600 bg-slate-800 px-1 text-slate-200"
-              />
-            </p>
+            <div className="mt-2 flex flex-wrap items-center gap-3 text-[11px] text-slate-500">
+              <label className="flex items-center gap-1.5">
+                <input
+                  type="checkbox"
+                  checked={settings.autoSensitivity}
+                  onChange={(e) =>
+                    setSettings((s) => ({
+                      ...s,
+                      autoSensitivity: e.target.checked,
+                    }))
+                  }
+                  className="accent-sky-500"
+                />
+                自動微調閾值
+              </label>
+              <span>
+                最小 blob：
+                <input
+                  type="number"
+                  min={10}
+                  max={500}
+                  value={settings.minBlobPixels}
+                  onChange={(e) =>
+                    setSettings((s) => ({
+                      ...s,
+                      minBlobPixels: Number(e.target.value) || 40,
+                    }))
+                  }
+                  className="ml-1 w-14 rounded border border-slate-600 bg-slate-800 px-1 text-slate-200"
+                />
+              </span>
+              <button
+                type="button"
+                onClick={() => setShowAdvanced((v) => !v)}
+                className="text-sky-400 hover:underline"
+              >
+                {showAdvanced ? "收合進階" : "進階參數"}
+              </button>
+            </div>
+
+            {showAdvanced && (
+              <div className="mt-3 space-y-2 border-t border-slate-800 pt-3 text-[11px] text-slate-400">
+                <label className="flex items-center justify-between gap-2">
+                  <span>位置平滑 EMA</span>
+                  <input
+                    type="range"
+                    min={15}
+                    max={90}
+                    value={Math.round(settings.emaAlpha * 100)}
+                    onChange={(e) =>
+                      setSettings((s) => ({
+                        ...s,
+                        emaAlpha: Number(e.target.value) / 100,
+                      }))
+                    }
+                    className="w-32 accent-sky-500"
+                  />
+                  <span className="w-8 font-mono text-slate-300">
+                    {settings.emaAlpha.toFixed(2)}
+                  </span>
+                </label>
+                <label className="flex items-center justify-between gap-2">
+                  <span>背景學習率</span>
+                  <input
+                    type="range"
+                    min={1}
+                    max={15}
+                    value={Math.round(settings.bgLearningRate * 100)}
+                    onChange={(e) =>
+                      setSettings((s) => ({
+                        ...s,
+                        bgLearningRate: Number(e.target.value) / 100,
+                      }))
+                    }
+                    className="w-32 accent-sky-500"
+                  />
+                  <span className="w-8 font-mono text-slate-300">
+                    {settings.bgLearningRate.toFixed(2)}
+                  </span>
+                </label>
+                <label className="flex items-center gap-1.5">
+                  <input
+                    type="checkbox"
+                    checked={settings.rpmEnabled}
+                    onChange={(e) =>
+                      setSettings((s) => ({
+                        ...s,
+                        rpmEnabled: e.target.checked,
+                      }))
+                    }
+                    className="accent-amber-500"
+                  />
+                  實驗性 RPM（需球表高對比標記／色塊）
+                </label>
+                <label className="flex items-center justify-between gap-2">
+                  <span>RPM 對比門檻</span>
+                  <input
+                    type="range"
+                    min={8}
+                    max={40}
+                    value={settings.rpmMinContrast}
+                    onChange={(e) =>
+                      setSettings((s) => ({
+                        ...s,
+                        rpmMinContrast: Number(e.target.value),
+                      }))
+                    }
+                    className="w-32 accent-amber-500"
+                  />
+                  <span className="w-8 font-mono text-slate-300">
+                    {settings.rpmMinContrast}
+                  </span>
+                </label>
+                <p className="text-[10px] leading-relaxed text-amber-500/80">
+                  RPM 為實驗功能：以球表極座標相關估角速度，可靠度受光線、模糊、無標記影響。UI
+                  會標信心；請勿當作正式量測。
+                </p>
+              </div>
+            )}
+
             {phase === "calibrate" && corners && (
               <p className="mt-2 text-[11px] text-sky-400/90">
-                拖曳藍點對準球道四角：
+                拖曳藍點對準球道四角（或用自動偵測）：
                 {Object.entries(CORNER_LABELS)
                   .map(([k, v]) => `${k.toUpperCase()}=${v}`)
                   .join("；")}
@@ -649,12 +858,8 @@ export default function Workbench() {
           </div>
         </div>
 
-        {/* 側欄 */}
         <div className="flex flex-col gap-3">
-          <LaneMap
-            shots={session?.shots ?? []}
-            livePath={livePath}
-          />
+          <LaneMap shots={session?.shots ?? []} livePath={livePath} />
           <ShotStats
             shots={session?.shots ?? []}
             liveEstimate={liveEstimate}

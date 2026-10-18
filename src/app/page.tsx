@@ -4,12 +4,13 @@ export default function HomePage() {
   return (
     <main className="mx-auto flex min-h-dvh max-w-2xl flex-col justify-center gap-8 px-4 py-10">
       <div>
-        <p className="mb-2 text-sm font-medium text-sky-400">Bowl Track MVP</p>
+        <p className="mb-2 text-sm font-medium text-sky-400">Bowl Track</p>
         <h1 className="text-3xl font-bold tracking-tight text-white sm:text-4xl">
           保齡球球路追蹤
         </h1>
         <p className="mt-3 text-slate-400 leading-relaxed">
-          類似 LaneTrax 的精簡瀏覽器版：用手機鏡頭或上傳影片，手動標定球道四角，以幀差追球並在 39-board 球道圖上畫出路徑，粗估箭頭區／breakpoint／進袋 board。
+          類似 LaneTrax 的瀏覽器版：鏡頭／上傳、自動或手動球道四角、穩健追球，並粗估
+          Foul／Arrows／Breakpoint／角度／球速／Hook／Shot time，以及實驗性 RPM。
         </p>
       </div>
 
@@ -17,22 +18,22 @@ export default function HomePage() {
         <li>
           <span className="font-semibold text-slate-100">1. 開啟鏡頭或上傳</span>
           <br />
-          建議從球道側後方拍攝；手機優先使用後置鏡頭。
+          從球道後方拍攝，畫面需見到 foul line～pins（參考 LaneTrax）。
         </li>
         <li>
-          <span className="font-semibold text-slate-100">2. 拖曳四角</span>
+          <span className="font-semibold text-slate-100">2. 自動偵測或拖曳四角</span>
           <br />
-          後方拍攝時：上兩邊對準 pin deck，下兩邊對準 foul line（可拖曳調整）。
+          按「自動偵測球道」估四角；失敗或不準可手動拖藍點。
         </li>
         <li>
           <span className="font-semibold text-slate-100">3. 開始追蹤</span>
           <br />
-          投球後自動疊軌跡；球消失數幀後結束一投並存入本機。
+          背景模型＋ROI＋平滑／丟幀預測；投球後自動存檔。
         </li>
         <li>
-          <span className="font-semibold text-slate-100">4. 查看球道圖與粗估</span>
+          <span className="font-semibold text-slate-100">4. 查看指標</span>
           <br />
-          側欄顯示路徑與箭頭／BP／袋口 board、可選球速。
+          側欄顯示 board、角度、球速、Hook、Shot time；RPM 標為實驗／需球標。
         </li>
       </ol>
 
@@ -46,7 +47,9 @@ export default function HomePage() {
       </div>
 
       <p className="text-xs text-slate-600 leading-relaxed">
-        已知限制：依賴光線與球／背景對比；深色球在暗道上可能追不到；四角需手動；透視與球速為粗估，非正式量測。資料僅存瀏覽器 localStorage。
+        已知限制：自動偵測在暗光／無明顯亮球道時易失敗；RPM
+        需球表高對比標記且信心常偏低；數值為軌跡粗估，非正式雷達／光學量測。資料僅存
+        localStorage。
       </p>
     </main>
   );
