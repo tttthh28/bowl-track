@@ -85,7 +85,8 @@ export default function LaneMap({
         })}
         {/* feet 標記 */}
         {footMarks.map((f) => {
-          const y = pad + (f / LANE_L) * innerH;
+          // foul(0) 在下、pins(60) 在上，與 toXY 一致
+          const y = pad + ((LANE_L - f) / LANE_L) * innerH;
           return (
             <g key={`f${f}`}>
               <line

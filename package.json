@@ -6,7 +6,8 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "next lint"
+    "lint": "next lint",
+    "verify:tracker": "tsx scripts/verify-tracker-run.mts"
   },
   "dependencies": {
     "react": "^18",

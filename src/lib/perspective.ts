@@ -128,24 +128,65 @@ export function boardAtFeet(
   return best.lane.board;
 }
 
+type TimedLane = { lane: LanePoint; t: number; predicted?: boolean };
+
+function usableLanePoints(
+  points: { lane?: LanePoint; t: number; predicted?: boolean }[]
+): TimedLane[] {
+  return points.filter(
+    (p): p is TimedLane =>
+      !!p.lane && p.t >= 0 && !p.predicted
+  );
+}
+
 /**
- * 粗估球速：球道 feet 差／時間。
- * 1 mph ≈ 1.4667 ft/s。
+ * 粗估球速：沿軌跡累積往 pins 的 feet 進度／時間。
+ * 1 mph ≈ 1.4667 ft/s。過濾預測點與回跳雜訊。
  */
 export function estimateSpeedMph(
-  points: { lane?: LanePoint; t: number }[]
+  points: { lane?: LanePoint; t: number; predicted?: boolean }[]
 ): number | null {
-  const usable = points.filter((p) => p.lane && p.t >= 0);
+  const usable = usableLanePoints(points);
   if (usable.length < 4) return null;
+
+  // 滑窗中位數，降低亂線影響
+  const windows: number[] = [];
+  const step = Math.max(1, Math.floor(usable.length / 8));
+  for (let i = 0; i < usable.length - 3; i += step) {
+    const j = Math.min(usable.length - 1, i + Math.max(3, step * 2));
+    const a = usable[i];
+    const b = usable[j];
+    const dt = (b.t - a.t) / 1000;
+    if (dt < 0.08) continue;
+    let path = 0;
+    for (let k = i + 1; k <= j; k++) {
+      const df = usable[k].lane.feet - usable[k - 1].lane.feet;
+      if (df > -0.5) path += Math.max(0, df);
+    }
+    if (path < 1.5) continue;
+    const mph = path / dt / 1.4667;
+    if (mph >= 5 && mph <= 35) windows.push(mph);
+  }
+
+  if (windows.length >= 1) {
+    windows.sort((a, b) => a - b);
+    const med = windows[Math.floor(windows.length / 2)];
+    return Math.round(med * 10) / 10;
+  }
+
+  // 後備：首末有效點
   const first = usable[0];
   const last = usable[usable.length - 1];
   const dt = (last.t - first.t) / 1000;
-  if (dt < 0.15) return null;
-  const df = Math.abs(last.lane!.feet - first.lane!.feet);
-  if (df < 5) return null;
-  const ftPerSec = df / dt;
-  const mph = ftPerSec / 1.4667;
-  if (mph < 3 || mph > 40) return null;
+  if (dt < 0.12) return null;
+  let path = 0;
+  for (let i = 1; i < usable.length; i++) {
+    const df = usable[i].lane.feet - usable[i - 1].lane.feet;
+    if (df > -0.5) path += Math.max(0, df);
+  }
+  if (path < 3) return null;
+  const mph = path / dt / 1.4667;
+  if (mph < 5 || mph > 35) return null;
   return Math.round(mph * 10) / 10;
 }
 
@@ -170,26 +211,26 @@ export function defaultCorners(
  * 區段球速：只取 feet 落在 [feetLo, feetHi] 的點。
  */
 export function estimateSegmentSpeedMph(
-  points: { lane?: LanePoint; t: number }[],
+  points: { lane?: LanePoint; t: number; predicted?: boolean }[],
   feetLo: number,
   feetHi: number
 ): number | null {
-  const usable = points.filter(
-    (p) =>
-      p.lane &&
-      p.t >= 0 &&
-      p.lane.feet >= feetLo &&
-      p.lane.feet <= feetHi
+  const usable = usableLanePoints(points).filter(
+    (p) => p.lane.feet >= feetLo && p.lane.feet <= feetHi
   );
   if (usable.length < 3) return null;
   const first = usable[0];
   const last = usable[usable.length - 1];
   const dt = (last.t - first.t) / 1000;
-  if (dt < 0.08) return null;
-  const df = Math.abs(last.lane!.feet - first.lane!.feet);
-  if (df < 2) return null;
-  const mph = df / dt / 1.4667;
-  if (mph < 3 || mph > 40) return null;
+  if (dt < 0.06) return null;
+  let path = 0;
+  for (let i = 1; i < usable.length; i++) {
+    const df = usable[i].lane.feet - usable[i - 1].lane.feet;
+    if (df > -0.4) path += Math.max(0, df);
+  }
+  if (path < 1.2) return null;
+  const mph = path / dt / 1.4667;
+  if (mph < 5 || mph > 35) return null;
   return Math.round(mph * 10) / 10;
 }
 
@@ -206,7 +247,6 @@ export function feetAtMaxHook(
     .filter((p) => p.feet >= 12 && p.feet <= 52);
   if (withLane.length < 6) return 42;
 
-  // 重採樣到等距 feet
   const samples: { feet: number; board: number }[] = [];
   for (let f = 15; f <= 48; f += 2) {
     const b = boardAtFeet(points, f);

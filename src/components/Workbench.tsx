@@ -24,6 +24,7 @@ import {
   DEFAULT_TRACKER,
   getRpmEstimate,
   rgbaToGray,
+  shouldEndShot,
   trackBallFrame,
 } from "@/lib/tracker";
 import {
@@ -70,6 +71,8 @@ export default function Workbench() {
   const homoRef = useRef<Homography | null>(null);
   const settingsRef = useRef<TrackerSettings>({ ...DEFAULT_TRACKER });
   const sourceModeRef = useRef<SourceMode>("idle");
+  const lastVideoTimeRef = useRef<number>(0);
+  const finishingRef = useRef(false);
 
   const [session, setSession] = useState<SessionRecord | null>(null);
   const [sourceMode, setSourceMode] = useState<SourceMode>("idle");
@@ -328,11 +331,30 @@ export default function Workbench() {
     const points = [...livePointsRef.current];
     livePointsRef.current = [];
     trackerRef.current.lost = 0;
-    if (points.length < 5) {
+    const travelPx = (() => {
+      let d = 0;
+      for (let i = 1; i < points.length; i++) {
+        d += Math.hypot(
+          points[i].image.x - points[i - 1].image.x,
+          points[i].image.y - points[i - 1].image.y
+        );
+      }
+      return d;
+    })();
+    const feetSpan = (() => {
+      const ls = points.filter((p) => p.lane).map((p) => p.lane!.feet);
+      if (ls.length < 2) return 0;
+      return Math.max(...ls) - Math.min(...ls);
+    })();
+    if (points.length < 5 || travelPx < 28 || feetSpan < 4) {
       setLivePath([]);
-      setStatus("軌跡太短，已忽略（請調靈敏度或確認四角）");
-      trackerRef.current.prevPolar = null;
-      trackerRef.current.rpmSamples = [];
+      setStatus(
+        points.length === 0
+          ? "等待球出現…"
+          : "軌跡位移不足，已忽略（請點選紫色球，或確認四角／勿鎖導引線）"
+      );
+      trackerRef.current.beginNewShot();
+      finishingRef.current = false;
       return;
     }
     const rpm = getRpmEstimate(trackerRef.current);
@@ -364,13 +386,9 @@ export default function Workbench() {
           : "無球速"
       }${rpmTxt}`
     );
-    // 保留背景，清 RPM 樣本供下一投
-    trackerRef.current.prevPolar = null;
-    trackerRef.current.rpmSamples = [];
-    trackerRef.current.lastRpm = null;
-    trackerRef.current.lastRpmConf = 0;
-    trackerRef.current.ema = null;
-    trackerRef.current.vel = { x: 0, y: 0 };
+    // 保留背景模型，重置本投追蹤狀態（等下一顆球／點選）
+    trackerRef.current.beginNewShot();
+    finishingRef.current = false;
   }, []);
 
   useEffect(() => {
@@ -401,6 +419,24 @@ export default function Workbench() {
             : 33;
         lastFrameTRef.current = now;
 
+        // 影片 loop：currentTime 回繞 → 立刻 flush 未完成投
+        const vt = v.currentTime;
+        const prevVt = lastVideoTimeRef.current;
+        if (
+          sourceModeRef.current === "upload" &&
+          prevVt > 0.4 &&
+          vt + 0.35 < prevVt &&
+          livePointsRef.current.length > 0 &&
+          !finishingRef.current
+        ) {
+          finishingRef.current = true;
+          finishShot();
+          lastVideoTimeRef.current = vt;
+          drawOverlay();
+          return;
+        }
+        lastVideoTimeRef.current = vt;
+
         const frame = ctx.getImageData(0, 0, w, h);
         const gray = rgbaToGray(frame.data, w, h);
         const result = trackBallFrame(
@@ -410,50 +446,96 @@ export default function Workbench() {
           h,
           settingsRef.current,
           cornersRef.current,
-          dt
+          dt,
+          frame.data
         );
 
         if (livePointsRef.current.length % 10 === 0) {
           setDebugNoise(Math.round(result.noiseLevel));
         }
 
+        // 僅在已鎖定且有偵測／短預測時寫入軌跡（避免鎖導引線亂線）
         const pos = result.smoothed;
-        if (pos) {
+        if (
+          result.locked &&
+          pos &&
+          (result.raw != null || result.predicted)
+        ) {
           if (livePointsRef.current.length === 0 && !result.predicted) {
             shotStartRef.current = performance.now();
+            setStatus("已鎖定球，追蹤中…");
           }
           if (livePointsRef.current.length > 0 || !result.predicted) {
             const t = performance.now() - shotStartRef.current;
             const H = homoRef.current;
             const lane = H ? imageToLane(H, pos) : undefined;
-            const tp: TrackPoint = {
-              image: pos,
-              lane,
-              t,
-              predicted: result.predicted || undefined,
-            };
-            livePointsRef.current.push(tp);
-            if (livePointsRef.current.length % 3 === 0) {
-              const path = livePointsRef.current
-                .filter((p) => p.lane)
-                .map((p) => p.lane!);
-              setLivePath(path);
-              const rpm = getRpmEstimate(trackerRef.current);
-              setLiveEstimate(
-                computeShotEstimate(livePointsRef.current, rpm)
-              );
+            // 過濾明顯不合理的瞬間跳點（lane 空間）
+            const prev = livePointsRef.current[livePointsRef.current.length - 1];
+            let accept = true;
+            if (prev?.lane && lane && !result.predicted) {
+              const dFeet = Math.abs(lane.feet - prev.lane.feet);
+              const dBoard = Math.abs(lane.board - prev.lane.board);
+              const dtPt = Math.max(1, t - prev.t) / 1000;
+              if (dFeet / dtPt > 80 || dBoard > 12) accept = false;
+            }
+            if (accept) {
+              const tp: TrackPoint = {
+                image: pos,
+                lane,
+                t,
+                predicted: result.predicted || undefined,
+              };
+              livePointsRef.current.push(tp);
+              if (livePointsRef.current.length % 3 === 0) {
+                const path = livePointsRef.current
+                  .filter((p) => p.lane)
+                  .map((p) => p.lane!);
+                setLivePath(path);
+                const rpm = getRpmEstimate(trackerRef.current);
+                setLiveEstimate(
+                  computeShotEstimate(livePointsRef.current, rpm)
+                );
+              }
             }
           }
         }
 
         if (
-          trackerRef.current.lost >= settingsRef.current.lostFramesToEnd &&
-          livePointsRef.current.length > 0
+          !finishingRef.current &&
+          shouldEndShot(
+            trackerRef.current,
+            settingsRef.current,
+            livePointsRef.current.length > 0
+          )
         ) {
+          finishingRef.current = true;
           finishShot();
+        } else if (
+          !result.locked &&
+          livePointsRef.current.length > 0 &&
+          !finishingRef.current
+        ) {
+          // 誤鎖解除或尚未再鎖：有足夠位移則存檔，否則丟棄以免污染下一投
+          let travel = 0;
+          const pts = livePointsRef.current;
+          for (let i = 1; i < pts.length; i++) {
+            travel += Math.hypot(
+              pts[i].image.x - pts[i - 1].image.x,
+              pts[i].image.y - pts[i - 1].image.y
+            );
+          }
+          if (travel >= 28 && pts.length >= 5) {
+            finishingRef.current = true;
+            finishShot();
+          } else {
+            livePointsRef.current = [];
+            setLivePath([]);
+            trackerRef.current.beginNewShot();
+          }
         }
       } else {
         lastFrameTRef.current = 0;
+        lastVideoTimeRef.current = 0;
       }
 
       drawOverlay();
@@ -491,9 +573,19 @@ export default function Workbench() {
   };
 
   const onPointerDown = (e: React.PointerEvent) => {
-    if (phase !== "calibrate" || tracking) return;
     const p = clientToVideo(e.clientX, e.clientY);
     if (!p) return;
+    // 追蹤中點選＝指定球位置（解鎖誤追導引線／球員）
+    if (tracking) {
+      livePointsRef.current = [];
+      setLivePath([]);
+      setLiveEstimate(null);
+      trackerRef.current.seedAt(p);
+      shotStartRef.current = performance.now();
+      setStatus("已點選球位置，開始跟球…");
+      return;
+    }
+    if (phase !== "calibrate") return;
     const hit = hitCorner(p);
     if (hit) {
       setDragging(hit);
@@ -540,7 +632,11 @@ export default function Workbench() {
     setLiveEstimate(null);
     setPhase("track");
     setTracking(true);
-    setStatus("追蹤中…球通過後會自動存檔（黃點＝預測幀）");
+    lastVideoTimeRef.current = 0;
+    finishingRef.current = false;
+    setStatus(
+      "等待紫色／暗色球出現…也可直接點球鎖定；消失或影片重播會自動存檔"
+    );
   };
 
   const stopTracking = () => {
@@ -847,12 +943,18 @@ export default function Workbench() {
               </div>
             )}
 
-            {phase === "calibrate" && corners && (
+            {phase === "calibrate" && corners && !tracking && (
               <p className="mt-2 text-[11px] text-sky-400/90">
                 拖曳藍點對準球道四角（或用自動偵測）：
                 {Object.entries(CORNER_LABELS)
                   .map(([k, v]) => `${k.toUpperCase()}=${v}`)
                   .join("；")}
+              </p>
+            )}
+            {tracking && (
+              <p className="mt-2 text-[11px] text-orange-300/90">
+                追蹤中：偏好圓形紫／暗色球、忽略細長導引線。可點影片上的球強制鎖定；球出球道、到 pin
+                區後消失、或影片 loop 回繞時會結束並存檔。
               </p>
             )}
           </div>
