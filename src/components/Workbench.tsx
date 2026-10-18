@@ -1210,9 +1210,7 @@ export default function Workbench() {
             <canvas ref={canvasRef} className="hidden" />
             {!videoReady && (
               <div className="absolute inset-0 flex items-center justify-center bg-slate-950/80 p-6 text-center text-sm text-slate-400">
-                開啟手機後置鏡頭，或上傳球道側面／後方影片
-                <br />
-                （鏡頭需見到 foul line～pins，參考 LaneTrax）
+                開啟鏡頭或上傳影片
               </div>
             )}
           </div>
