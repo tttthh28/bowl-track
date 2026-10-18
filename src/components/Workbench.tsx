@@ -18,6 +18,7 @@ import { computeShotEstimate } from "@/lib/estimates";
 import {
   detectLaneFromCanvas,
   fallbackDefaultCorners,
+  frameHasLaneSignal,
   scoreLaneGeometry,
 } from "@/lib/laneDetect";
 import {
@@ -25,8 +26,10 @@ import {
   DEFAULT_TRACKER,
   getRpmEstimate,
   rgbaToGray,
+  scaleLaneCorners,
   shouldEndShot,
   trackBallFrame,
+  trackWorkSize,
 } from "@/lib/tracker";
 import {
   evaluateShotQuality,
@@ -65,6 +68,10 @@ export default function Workbench() {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const overlayRef = useRef<HTMLCanvasElement>(null);
+  /** 追蹤用縮圖 buffer（高於 TRACK_WORK_MAX_WIDTH 時） */
+  const trackBufRef = useRef<HTMLCanvasElement | null>(null);
+  /** 目前追蹤座標相對原影像嘅 scale（seedAt 要用） */
+  const trackScaleRef = useRef(1);
   const streamRef = useRef<MediaStream | null>(null);
   const rafRef = useRef<number>(0);
   const trackerRef = useRef(new BallTrackerState());
@@ -212,67 +219,151 @@ export default function Workbench() {
     }
     const wasPaused = v.paused;
     const restoreT = v.currentTime;
+    // 用 src／duration 判斷上傳片，唔好只信可能未 sync 嘅 sourceModeRef
+    const isUpload =
+      sourceModeRef.current === "upload" ||
+      (!!v.src && !v.srcObject && Number.isFinite(v.duration) && v.duration > 0.5);
+
     const seekTo = (t: number) =>
       new Promise<void>((resolve) => {
-        const done = () => {
-          v.removeEventListener("seeked", done);
+        let settled = false;
+        const finish = () => {
+          if (settled) return;
+          settled = true;
+          v.removeEventListener("seeked", onSeeked);
           resolve();
         };
-        v.addEventListener("seeked", done);
+        const onSeeked = () => {
+          // 等一幀再抓，減少黑幀
+          const rvfc = (
+            v as HTMLVideoElement & {
+              requestVideoFrameCallback?: (cb: () => void) => number;
+            }
+          ).requestVideoFrameCallback;
+          if (typeof rvfc === "function") {
+            rvfc.call(v, () => finish());
+            setTimeout(finish, 280);
+          } else {
+            setTimeout(finish, 40);
+          }
+        };
+        v.addEventListener("seeked", onSeeked);
         try {
-          v.currentTime = Math.max(0, Math.min(t, (v.duration || t) - 0.05));
+          const target = Math.max(
+            0,
+            Math.min(t, (v.duration || t) - 0.05)
+          );
+          // 同時間唔觸發 seeked：仍等一小段再抓
+          if (Math.abs(v.currentTime - target) < 0.03) {
+            setTimeout(finish, 50);
+            return;
+          }
+          v.currentTime = target;
         } catch {
-          resolve();
+          finish();
+          return;
         }
-        // 有啲瀏覽器唔觸發 seeked
-        setTimeout(done, 120);
+        // 有啲瀏覽器慢 seek／唔觸發 seeked
+        setTimeout(finish, 450);
       });
 
     try {
-      // 上傳片：一定 multi-seek，用幾何分揀最好（唔好只信第一幀信心）
-      const dur = Number.isFinite(v.duration) && v.duration > 1 ? v.duration : 0;
+      // 上傳片：暫停 + multi-seek，用幾何分揀；略過空白幀
+      if (isUpload && !wasPaused) {
+        try {
+          v.pause();
+        } catch {
+          /* ignore */
+        }
+      }
+      const dur =
+        Number.isFinite(v.duration) && v.duration > 1 ? v.duration : 0;
       const tryTimes =
-        sourceModeRef.current === "upload" && dur > 0
+        isUpload && dur > 0
           ? Array.from(
               new Set(
                 [
-                  0.05,
-                  Math.min(0.4, dur * 0.05),
-                  Math.min(1.0, dur * 0.12),
-                  Math.min(dur * 0.25, dur - 0.15),
-                  Math.min(dur * 0.4, dur - 0.15),
-                  Math.min(dur * 0.55, dur - 0.15),
-                  restoreT,
-                ].map((x) => Math.max(0, Math.min(x, Math.max(0, dur - 0.08))))
+                  0.08,
+                  Math.min(0.35, dur * 0.04),
+                  Math.min(0.8, dur * 0.1),
+                  Math.min(1.4, dur * 0.16),
+                  Math.min(dur * 0.28, dur - 0.12),
+                  Math.min(dur * 0.42, dur - 0.12),
+                  Math.min(dur * 0.58, dur - 0.12),
+                  Math.min(dur * 0.72, dur - 0.12),
+                  restoreT > 0.2 ? restoreT : dur * 0.2,
+                ].map((x) =>
+                  Math.max(0, Math.min(x, Math.max(0, dur - 0.06)))
+                )
               )
             )
-          : [restoreT, restoreT, restoreT];
+          : [restoreT, Math.max(0, restoreT - 0.15), restoreT + 0.1];
 
       let result: ReturnType<typeof detectLaneFromCanvas> = null;
       let bestScore = -1e9;
+      let attempts = 0;
+      let blankSkips = 0;
+      type DetCand = {
+        det: NonNullable<ReturnType<typeof detectLaneFromCanvas>>;
+        geom: number;
+      };
+      const detCands: DetCand[] = [];
       for (const tSeek of tryTimes) {
-        if (sourceModeRef.current === "upload" && dur > 0) {
+        if (isUpload && dur > 0) {
           await seekTo(tSeek);
+        } else if (!isUpload) {
+          // 鏡頭：連抓幾幀等曝光穩
+          await new Promise((r) => setTimeout(r, 30));
         }
         const canvas = grabFrameToCanvas();
         if (!canvas) continue;
+        const ctx = canvas.getContext("2d", { willReadFrequently: true });
+        if (!ctx) continue;
+        const img = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        if (!frameHasLaneSignal(img.data, canvas.width, canvas.height)) {
+          blankSkips++;
+          continue;
+        }
+        attempts++;
         const next = detectLaneFromCanvas(canvas);
         if (!next) continue;
-        const sc = scoreLaneGeometry(
-          next,
-          v.videoWidth,
-          v.videoHeight
-        );
+        const sc = scoreLaneGeometry(next, v.videoWidth, v.videoHeight);
+        detCands.push({ det: next, geom: sc });
         if (sc > bestScore) {
           bestScore = sc;
           result = next;
         }
         // 好幾何＋夠信心可提早停
-        if (sc >= 95 && next.confidence >= 0.7) break;
+        if (sc >= 92 && next.confidence >= 0.65) break;
+      }
+      // 多候選再排：單道寬＋中線近中央（避 geom 高但底邊吞鄰道／人 → arrows 卡 ~33.6）
+      if (detCands.length >= 2) {
+        const vw = v.videoWidth || 1;
+        let bestRank = -1e9;
+        for (const c of detCands) {
+          const corners = c.det.corners;
+          const botW = corners.br.x - corners.bl.x;
+          const botFrac = botW / vw;
+          const midBot = (corners.bl.x + corners.br.x) / 2;
+          const midFrac = Math.abs(midBot / vw - 0.5);
+          const widthOk =
+            botFrac >= 0.32 && botFrac <= 0.48
+              ? 28
+              : botFrac >= 0.28 && botFrac <= 0.52
+                ? 8
+                : -35;
+          const midOk = midFrac < 0.1 ? 22 : midFrac < 0.16 ? 6 : -30;
+          const rank = c.geom + widthOk + midOk;
+          if (rank > bestRank) {
+            bestRank = rank;
+            result = c.det;
+            bestScore = rank;
+          }
+        }
       }
 
       // 還原播放位置
-      if (sourceModeRef.current === "upload" && dur > 0) {
+      if (isUpload && dur > 0) {
         await seekTo(restoreT);
         if (!wasPaused) {
           try {
@@ -283,19 +374,25 @@ export default function Workbench() {
         }
       }
 
-      if (!result) {
+      // 幾何太差先當失敗（唔好用假梯形當成功）
+      const accept =
+        result &&
+        (bestScore >= 55 || result.confidence >= 0.45);
+      if (!accept) {
         const fb = fallbackDefaultCorners(v.videoWidth, v.videoHeight);
         persistCorners(fb);
-        setDetectMsg("自動偵測失敗，已退回預設四角，請手動拖曳");
+        setDetectMsg(
+          `自動偵測失敗${blankSkips ? `（略過空白 ${blankSkips}）` : ""}，已退回預設四角，請手動拖曳`
+        );
         setStatus("自動偵測失敗 → 請手動對準 foul～pins");
         return;
       }
-      persistCorners(result.corners);
+      persistCorners(result!.corners);
       setDetectMsg(
-        `${result.message}（信心 ${(result.confidence * 100).toFixed(0)}%）`
+        `${result!.message}（信心 ${(result!.confidence * 100).toFixed(0)}% · ${attempts}幀）`
       );
       setStatus(
-        result.confidence >= 0.55
+        result!.confidence >= 0.55
           ? "自動偵測完成，可微調藍點後開始追蹤"
           : "自動偵測信心偏低，建議手動調整四角"
       );
@@ -599,17 +696,48 @@ export default function Workbench() {
         }
         lastVideoTimeRef.current = vt;
 
-        const frame = ctx.getImageData(0, 0, w, h);
-        const gray = rgbaToGray(frame.data, w, h);
+        // 高解析度縮到 ~640 寬再追（同 offline verify）；座標映射返原圖
+        const { scale, tw, th } = trackWorkSize(w, h);
+        trackScaleRef.current = scale;
+        let trackRgba: Uint8ClampedArray;
+        let trackW = w;
+        let trackH = h;
+        let trackCorners = cornersRef.current;
+        if (scale < 1) {
+          let buf = trackBufRef.current;
+          if (!buf) {
+            buf = document.createElement("canvas");
+            trackBufRef.current = buf;
+          }
+          if (buf.width !== tw || buf.height !== th) {
+            buf.width = tw;
+            buf.height = th;
+          }
+          const tctx = buf.getContext("2d", { willReadFrequently: true });
+          if (!tctx) {
+            drawOverlay();
+            return;
+          }
+          tctx.drawImage(canvas, 0, 0, tw, th);
+          const small = tctx.getImageData(0, 0, tw, th);
+          trackRgba = small.data;
+          trackW = tw;
+          trackH = th;
+          trackCorners = scaleLaneCorners(cornersRef.current, scale);
+        } else {
+          const frame = ctx.getImageData(0, 0, w, h);
+          trackRgba = frame.data;
+        }
+        const gray = rgbaToGray(trackRgba, trackW, trackH);
         const result = trackBallFrame(
           trackerRef.current,
           gray,
-          w,
-          h,
+          trackW,
+          trackH,
           settingsRef.current,
-          cornersRef.current,
+          trackCorners,
           dt,
-          frame.data
+          trackRgba
         );
 
         if (livePointsRef.current.length % 10 === 0) {
@@ -626,7 +754,15 @@ export default function Workbench() {
           performance.now() < shotCooldownUntilRef.current;
 
         // 僅在已鎖定且有偵測／短預測時寫入軌跡（避免鎖導引線亂線）
-        const pos = result.smoothed;
+        // smoothed 喺工作解析度 → 映返原影像座標做 lane／overlay
+        const pos = result.smoothed
+          ? scale < 1
+            ? {
+                x: result.smoothed.x / scale,
+                y: result.smoothed.y / scale,
+              }
+            : result.smoothed
+          : null;
         if (
           !blockNewShot &&
           result.locked &&
@@ -762,7 +898,8 @@ export default function Workbench() {
       livePointsRef.current = [];
       setLivePath([]);
       setLiveEstimate(null);
-      trackerRef.current.seedAt(p);
+      const s = trackScaleRef.current || 1;
+      trackerRef.current.seedAt({ x: p.x * s, y: p.y * s });
       shotStartRef.current = performance.now();
       setStatus("已點選球位置，開始跟球…");
       return;
@@ -809,6 +946,7 @@ export default function Workbench() {
     }
     livePointsRef.current = [];
     trackerRef.current.reset();
+    trackScaleRef.current = 1;
     lastFrameTRef.current = 0;
     setLivePath([]);
     setLiveEstimate(null);

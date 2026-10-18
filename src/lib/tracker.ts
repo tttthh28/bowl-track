@@ -132,6 +132,40 @@ export class BallTrackerState {
   }
 }
 
+/**
+ * 追蹤工作解析度上限：原生 1080p 直接追易鎖錯溝／導引線；
+ * offline verify 用 ~640 寬穩定。高於此外將縮圖再追，座標再映射返原圖。
+ */
+export const TRACK_WORK_MAX_WIDTH = 640;
+
+export function trackWorkSize(
+  width: number,
+  height: number
+): { scale: number; tw: number; th: number } {
+  if (width <= TRACK_WORK_MAX_WIDTH) {
+    return { scale: 1, tw: width, th: height };
+  }
+  const scale = TRACK_WORK_MAX_WIDTH / width;
+  return {
+    scale,
+    tw: Math.max(80, Math.round(width * scale)),
+    th: Math.max(80, Math.round(height * scale)),
+  };
+}
+
+export function scaleLaneCorners(
+  corners: LaneCorners,
+  scale: number
+): LaneCorners {
+  if (scale === 1) return corners;
+  return {
+    tl: { x: corners.tl.x * scale, y: corners.tl.y * scale },
+    tr: { x: corners.tr.x * scale, y: corners.tr.y * scale },
+    br: { x: corners.br.x * scale, y: corners.br.y * scale },
+    bl: { x: corners.bl.x * scale, y: corners.bl.y * scale },
+  };
+}
+
 export function rgbaToGray(
   data: Uint8ClampedArray,
   width: number,

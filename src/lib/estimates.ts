@@ -21,16 +21,63 @@ export function computeShotEstimate(
   const extrapolated: EstimateExtrapolated = {};
 
   const foulBoard = boardAtFeet(points, 1);
-  // 箭頭 15′：覆蓋略過 15 時短距回推；唔好用遠點硬填
+  // 箭頭 15′：覆蓋內插值；略過／略早則短距外推（常見 lock 喺 16–24′）
+  // 舊門檻 minFeet≤20 令 20.7′ 起鎖永遠 arrows=null／或 UI 殘留常數
   let arrowsBoard = boardAtFeet(points, 15);
-  if (arrowsBoard == null && cov && cov.minFeet <= 20 && cov.minFeet >= 12) {
-    const near = boardAtFeetDetailed(points, 15, {
-      allowExtrapolate: true,
-      maxGap: 5,
-    });
-    if (near) {
-      arrowsBoard = near.board;
-      if (near.extrapolated) extrapolated.arrows = true;
+  if (arrowsBoard == null && cov && cov.maxFeet >= 14) {
+    const gapAhead = cov.minFeet - 15; // >0＝覆蓋喺 15′ 之後
+    const gapBehind = 15 - cov.maxFeet; // >0＝覆蓋未到 15′
+    if (gapAhead >= 0 && gapAhead <= 12 && cov.minFeet >= 10) {
+      const near = boardAtFeetDetailed(points, 15, {
+        allowExtrapolate: true,
+        maxGap: Math.max(5, Math.ceil(gapAhead) + 2),
+      });
+      if (near) {
+        arrowsBoard = near.board;
+        if (near.extrapolated || gapAhead > 1.5) extrapolated.arrows = true;
+      }
+    } else if (gapBehind > 0 && gapBehind <= 6 && cov.maxFeet >= 10) {
+      const near = boardAtFeetDetailed(points, 15, {
+        allowExtrapolate: true,
+        maxGap: Math.max(4, Math.ceil(gapBehind) + 1),
+      });
+      if (near) {
+        arrowsBoard = near.board;
+        extrapolated.arrows = true;
+      }
+    }
+    // 仍無：用最早覆蓋點做箭頭區代理（標外推）
+    if (arrowsBoard == null && cov.minFeet >= 10 && cov.minFeet <= 24) {
+      const early = boardAtFeetDetailed(points, cov.minFeet, {
+        allowExtrapolate: false,
+        maxGap: 2.5,
+      });
+      if (early) {
+        arrowsBoard = early.board;
+        if (Math.abs(cov.minFeet - 15) > 1.2) extrapolated.arrows = true;
+      }
+    }
+  }
+  if (arrowsBoard != null) {
+    arrowsBoard = Math.round(arrowsBoard * 10) / 10;
+    // 溝外無理值當缺失（壞角／誤鎖）
+    if (arrowsBoard < -1 || arrowsBoard > 40) arrowsBoard = null;
+  }
+  // 卡死右／左溝：整段 board 幾乎唔變且貼邊（舊 bug 常見 33.6）→ 當無效
+  if (arrowsBoard != null && cov && cov.count >= 4) {
+    const boards = points
+      .filter((p) => p.lane && !p.predicted)
+      .map((p) => p.lane!.board);
+    if (boards.length >= 4) {
+      const sorted = [...boards].sort((a, b) => a - b);
+      const med = sorted[Math.floor(sorted.length / 2)];
+      const span = sorted[sorted.length - 1] - sorted[0];
+      const nearGutter = med <= 4 || med >= 34;
+      const flat = span < 3.5;
+      if (flat && nearGutter && (arrowsBoard <= 5 || arrowsBoard >= 32)) {
+        arrowsBoard = null;
+        delete extrapolated.arrows;
+      }
     }
   }
   const entryBoard = arrowsBoard;

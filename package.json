@@ -12,7 +12,8 @@
     "db:studio": "drizzle-kit studio",
     "score:accuracy": "tsx scripts/score-accuracy.mts",
     "verify:lane": "tsx scripts/verify-lane-detect.mts",
-    "verify:offline-metrics": "tsx scripts/offline-metrics-demo.mts"
+    "verify:offline-metrics": "tsx scripts/offline-metrics-demo.mts",
+    "verify:arrows": "tsx scripts/verify-arrows-variance.mts"
   },
   "dependencies": {
     "@neondatabase/serverless": "^1.2.0",

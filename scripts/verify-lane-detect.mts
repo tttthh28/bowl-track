@@ -10,7 +10,7 @@
 import { execSync } from "child_process";
 import { readFileSync, mkdirSync, existsSync } from "fs";
 import { join } from "path";
-import { detectLaneCorners, scoreLaneGeometry } from "../src/lib/laneDetect.ts";
+import { detectLaneCorners, scoreLaneGeometry, frameHasLaneSignal, fallbackDefaultCorners } from "../src/lib/laneDetect.ts";
 import {
   BallTrackerState,
   DEFAULT_TRACKER,
@@ -192,6 +192,60 @@ if (seed) {
     path.length < 5 || ratio >= 0.55,
     `majority of ball path in quad (${(ratio * 100).toFixed(0)}%, n=${path.length})`
   );
+}
+
+// --- multi-seek 模擬：即使夾雜黑幀，只要有真幀就唔好退預設 ---
+{
+  const black = new Uint8ClampedArray(frameBytes);
+  assert(!frameHasLaneSignal(black, W, H), "black frame has no lane signal");
+  assert(detectLaneCorners(black, W, H) == null, "black → null detect");
+
+  let best: ReturnType<typeof detectLaneCorners> = null;
+  let bestSc = -1e9;
+  let blanks = 0;
+  // 模擬 5 次「用戶按自動偵測」：每次抽 7 個時間點，30% 黑幀
+  let runsOk = 0;
+  for (let run = 0; run < 5; run++) {
+    best = null;
+    bestSc = -1e9;
+    blanks = 0;
+    const idxs = [0, 3, 8, 12, 20, 28, 35 + run].map((i) => Math.min(dets.length ? N - 1 : 0, i));
+    for (let j = 0; j < idxs.length; j++) {
+      const useBlack = j % 3 === 0 && run > 0; // run0 全真；其餘夾黑
+      if (useBlack) {
+        blanks++;
+        continue;
+      }
+      const offset = idxs[j] * frameBytes;
+      if (offset + frameBytes > raw.length) continue;
+      const rgba = new Uint8ClampedArray(
+        raw.buffer,
+        raw.byteOffset + offset,
+        frameBytes
+      );
+      if (!frameHasLaneSignal(rgba, W, H)) {
+        blanks++;
+        continue;
+      }
+      const next = detectLaneCorners(new Uint8ClampedArray(rgba), W, H);
+      if (!next) continue;
+      const sc = scoreLaneGeometry(next, W, H);
+      if (sc > bestSc) {
+        bestSc = sc;
+        best = next;
+      }
+    }
+    const accept = best && (bestSc >= 55 || best.confidence >= 0.45);
+    if (accept) runsOk++;
+    else console.error(`multi-seek run ${run} FALLBACK blanks=${blanks}`);
+  }
+  assert(runsOk >= 4, `multi-seek ≥80% accept (got ${runsOk}/5)`);
+  // 與預設四角要明顯唔同（證明唔係 silently 用 default）
+  if (best) {
+    const def = fallbackDefaultCorners(W, H);
+    const d = Math.hypot(best.corners.tl.x - def.tl.x, best.corners.bl.x - def.bl.x);
+    assert(d > 20, `best corners differ from default (d=${d.toFixed(0)})`);
+  }
 }
 
 if (failed) {

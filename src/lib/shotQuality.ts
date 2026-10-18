@@ -52,12 +52,26 @@ export function evaluateShotQuality(points: TrackPoint[]): ShotQualityResult {
   }
 
   // 略放寬：漏存真投優先；左溝仍靠 board／feetPerSec 擋
+  // 原生高解析度／中段起鎖時 feetSpan 可 ~5–6′ 但仍係真投（travel 大）
   const MIN_POINTS = 8;
   const MIN_TRAVEL = 42;
-  const MIN_FEET = 7;
-  const MIN_MS = 420;
+  const MIN_FEET = 5;
+  const MIN_MS = 380;
   // 真球約 12–22 mph → 17–32 ft/s；誤鎖溝邊常 <2 ft/s
-  const MIN_FEET_PER_SEC = 1.8;
+  const MIN_FEET_PER_SEC = 1.5;
+
+  // 淨進度明顯倒退（鎖錯／預測回彈）→ 拒
+  if (lanePts.length >= 6 && netFeet < feetSpan * 0.35 && feetSpan >= 3) {
+    return {
+      ok: false,
+      reason: `倒退淨${netFeet.toFixed(1)}′`,
+      travelPx,
+      feetSpan,
+      durationMs,
+      feetPerSec,
+      medianBoard,
+    };
+  }
 
   if (points.length < MIN_POINTS) {
     return {
@@ -81,7 +95,14 @@ export function evaluateShotQuality(points: TrackPoint[]): ShotQualityResult {
       medianBoard,
     };
   }
-  if (feetSpan < MIN_FEET) {
+  // feet 短但影像位移＋時長夠：中段起鎖真投（唔好用 0.2′／4′ 假軌）
+  const shortButReal =
+    feetSpan >= 3.5 &&
+    travelPx >= 120 &&
+    durationMs >= 700 &&
+    feetPerSec >= 1.2 &&
+    (medianBoard == null || (medianBoard >= 4 && medianBoard <= 36));
+  if (feetSpan < MIN_FEET && !shortButReal) {
     return {
       ok: false,
       reason: `${feetSpan.toFixed(1)}′`,
@@ -103,7 +124,7 @@ export function evaluateShotQuality(points: TrackPoint[]): ShotQualityResult {
       medianBoard,
     };
   }
-  if (feetPerSec < MIN_FEET_PER_SEC && feetSpan < 22) {
+  if (feetPerSec < MIN_FEET_PER_SEC && feetSpan < 18 && !shortButReal) {
     return {
       ok: false,
       reason: `進度${feetPerSec.toFixed(1)}′/s`,
