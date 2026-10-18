@@ -131,6 +131,73 @@ export function trajectoryCoverage(
  * - allowExtrapolate：以覆蓋端點附近斜率短距外推，並標 extrapolated。
  * - maxGap：端點／最近點距離超過此值視為不足。
  */
+
+/** 最長「大致往 pins 前進」段（feet 單調上升），剪掉回跳／誤鎖 */
+export function longestForwardLanePoints(
+  points: { lane?: LanePoint; predicted?: boolean }[]
+): LanePoint[] {
+  const withLane = points
+    .filter((p): p is { lane: LanePoint; predicted?: boolean } => !!p.lane && !p.predicted)
+    .map((p) => p.lane);
+  if (withLane.length < 2) return withLane;
+
+  const spanOf = (seg: LanePoint[]) => {
+    if (seg.length < 2) return 0;
+    let lo = seg[0].feet;
+    let hi = seg[0].feet;
+    for (const p of seg) {
+      if (p.feet < lo) lo = p.feet;
+      if (p.feet > hi) hi = p.feet;
+    }
+    return hi - lo;
+  };
+
+  let best: LanePoint[] = [];
+  let bestSpan = -1;
+  let cur: LanePoint[] = [withLane[0]];
+  for (let i = 1; i < withLane.length; i++) {
+    const prev = cur[cur.length - 1];
+    const p = withLane[i];
+    // 允許小回跳（透視噪）；大回跳＝斷段
+    if (p.feet >= prev.feet - 0.8) {
+      cur.push(p);
+    } else {
+      const sp = spanOf(cur);
+      // 優先 feet 跨距（唔好揀瓶口怠速好多點但 span≈0）
+      if (sp > bestSpan || (Math.abs(sp - bestSpan) < 0.5 && cur.length > best.length)) {
+        best = cur;
+        bestSpan = sp;
+      }
+      cur = [p];
+    }
+  }
+  const sp = spanOf(cur);
+  if (sp > bestSpan || (Math.abs(sp - bestSpan) < 0.5 && cur.length > best.length)) {
+    best = cur;
+    bestSpan = sp;
+  }
+  return best.length >= 2 && bestSpan >= 3 ? best : withLane;
+}
+
+/**
+ * 早段 board/feet 斜率是否離譜（誤鎖橫掃溝邊常見 >1.2 board/ft）。
+ * 用 forward 段頭 ~12′ 窗。
+ */
+export function earlyBoardSlopeAbs(
+  points: { lane?: LanePoint; predicted?: boolean }[]
+): number | null {
+  const fwd = longestForwardLanePoints(points);
+  if (fwd.length < 3) return null;
+  const minF = fwd[0].feet;
+  const window = fwd.filter((p) => p.feet <= minF + 12);
+  if (window.length < 3) return null;
+  const a = window[0];
+  const b = window[window.length - 1];
+  const df = b.feet - a.feet;
+  if (df < 2) return null;
+  return Math.abs((b.board - a.board) / df);
+}
+
 export function boardAtFeetDetailed(
   points: { lane?: LanePoint; predicted?: boolean }[],
   targetFeet: number,
@@ -142,13 +209,22 @@ export function boardAtFeetDetailed(
 ): BoardAtFeetResult | null {
   const allowExtrapolate = opts?.allowExtrapolate ?? false;
   const maxGap = opts?.maxGap ?? 3;
-  const withLane = points.filter(
+  const rawLane = points.filter(
     (p): p is { lane: LanePoint; predicted?: boolean } =>
       !!p.lane && !p.predicted
   );
-  if (withLane.length < 2) return null;
+  if (rawLane.length < 2) return null;
 
-  const cov = trajectoryCoverage(points);
+  // 優先用最長前進段，避免回跳／誤鎖橫掃污染 15′ arrows
+  const fwdOnly = longestForwardLanePoints(points);
+  const withLane =
+    fwdOnly.length >= 2
+      ? fwdOnly.map((lane) => ({ lane }))
+      : rawLane;
+
+  const cov = trajectoryCoverage(
+    withLane.map((p) => ({ lane: p.lane, predicted: false }))
+  );
   if (!cov) return null;
 
   // 區段內線性插值
@@ -694,9 +770,26 @@ export function feetAtMaxHook(
       bestFeet = samples[i].feet;
     }
   }
-  // 曲率過平：取覆蓋中段而非虛構 42′
+  // 曲率過平：唔好報中段當 BP（常變 15′／mid-lane 假常數）
   if (bestCurv < 0.05) {
-    return Math.round(((cov.minFeet + cov.maxFeet) / 2) * 10) / 10;
+    return null;
+  }
+  // 覆蓋已過 arrows 帶時，BP 唔應落喺 ≤20′（假 mid／卡 15′）
+  if (bestFeet <= 20 && cov.maxFeet >= 28) {
+    const deep = samples.filter((s) => s.feet >= 28);
+    if (deep.length >= 3) {
+      let di = 0;
+      let db = deep[0].board;
+      for (let i = 1; i < deep.length; i++) {
+        const b = deep[i].board;
+        if (hookLeft ? b < db : b > db) {
+          db = b;
+          di = i;
+        }
+      }
+      return deep[di].feet;
+    }
+    return null;
   }
   return bestFeet;
 }

@@ -1,10 +1,12 @@
 import {
   boardAtFeet,
   boardAtFeetDetailed,
+  earlyBoardSlopeAbs,
   estimateSegmentSpeedMph,
   estimateSpeedMph,
   feetAtMaxHook,
   findActiveRollSpan,
+  longestForwardLanePoints,
   trajectoryCoverage,
 } from "./perspective";
 import type { EstimateExtrapolated, ShotEstimate, TrackPoint } from "./types";
@@ -21,8 +23,7 @@ export function computeShotEstimate(
   const extrapolated: EstimateExtrapolated = {};
 
   const foulBoard = boardAtFeet(points, 1);
-  // 箭頭 15′：覆蓋內插值；略過／略早則短距外推（常見 lock 喺 16–24′）
-  // 舊門檻 minFeet≤20 令 20.7′ 起鎖永遠 arrows=null／或 UI 殘留常數
+  // 箭頭 15′：用前進段插值／短距外推；拒溝邊橫掃同 mid-lane 假常數
   let arrowsBoard = boardAtFeet(points, 15);
   if (arrowsBoard == null && cov && cov.maxFeet >= 14) {
     const gapAhead = cov.minFeet - 15; // >0＝覆蓋喺 15′ 之後
@@ -58,16 +59,94 @@ export function computeShotEstimate(
       }
     }
   }
+
+  // 早段橫掃溝（|slope| 過大）→ 15′ 插值不可信
+  const earlySlope = earlyBoardSlopeAbs(points);
+  let arrowsFromSlopeFix = false;
+  // 只喺 15′ 本身貼溝／極端時先救；合理 board（如 7–28）唔好用深段蓋過
+  if (
+    arrowsBoard != null &&
+    earlySlope != null &&
+    earlySlope > 1.15 &&
+    (arrowsBoard >= 30 || arrowsBoard <= 6) &&
+    cov &&
+    cov.maxFeet >= 22
+  ) {
+    const fwd = longestForwardLanePoints(points);
+    const peak = fwd.reduce(
+      (m, p) => (p.feet > m.feet ? p : m),
+      fwd[0]
+    );
+    // 用後半穩段（近 peak）斜率回推；斜率仍離譜 → 用 peak board（標外推）或 —
+    const late = fwd.filter(
+      (p) => p.feet >= Math.max(peak.feet - 18, cov.minFeet + 6)
+    );
+    if (late.length >= 3) {
+      const a = late[0];
+      const b = late[late.length - 1];
+      const df = b.feet - a.feet;
+      if (df >= 4) {
+        const slope = (b.board - a.board) / df;
+        if (Math.abs(slope) <= 0.85) {
+          const mono = a.board + slope * (15 - a.feet);
+          if (mono >= 2 && mono <= 37) {
+            arrowsBoard = mono;
+            extrapolated.arrows = true;
+            arrowsFromSlopeFix = true;
+          } else {
+            arrowsBoard = null;
+            delete extrapolated.arrows;
+            arrowsFromSlopeFix = true;
+          }
+        } else if (
+          peak.board >= 6 &&
+          peak.board <= 28 &&
+          Math.abs(peak.board - 19.5) > 2
+        ) {
+          // 深段 board 可信時用嚟代理 arrows（常見 hook 後接近 entry）
+          arrowsBoard = peak.board;
+          extrapolated.arrows = true;
+          arrowsFromSlopeFix = true;
+        } else {
+          arrowsBoard = null;
+          delete extrapolated.arrows;
+          arrowsFromSlopeFix = true;
+        }
+      } else if (arrowsBoard >= 30 || arrowsBoard <= 6) {
+        arrowsBoard = null;
+        delete extrapolated.arrows;
+      }
+    } else if (arrowsBoard >= 30 || arrowsBoard <= 6) {
+      arrowsBoard = null;
+      delete extrapolated.arrows;
+    }
+  }
+
   if (arrowsBoard != null) {
     arrowsBoard = Math.round(arrowsBoard * 10) / 10;
     // 溝外無理值當缺失（壞角／誤鎖）
     if (arrowsBoard < -1 || arrowsBoard > 40) arrowsBoard = null;
   }
+
+  // 本地 12–18′ 窗中位（前進段）— 同插值差太大就改信中位
+  // 早段橫掃已修正時唔好再用 12–18′ 溝邊窗蓋過
+  if (arrowsBoard != null && cov && !arrowsFromSlopeFix) {
+    const fwd = longestForwardLanePoints(points);
+    const band = fwd.filter((p) => p.feet >= 12 && p.feet <= 18);
+    if (band.length >= 3) {
+      const sortedB = [...band.map((p) => p.board)].sort((a, b) => a - b);
+      const medBand = sortedB[Math.floor(sortedB.length / 2)];
+      const bandSpan = sortedB[sortedB.length - 1] - sortedB[0];
+      // 窗內唔係橫掃溝時，插值若離中位 >4 board → 改中位
+      if (bandSpan < 10 && Math.abs(arrowsBoard - medBand) > 4) {
+        arrowsBoard = Math.round(medBand * 10) / 10;
+      }
+    }
+  }
+
   // 卡死右／左溝：整段 board 幾乎唔變且貼邊（舊 bug 常見 33.6）→ 當無效
   if (arrowsBoard != null && cov && cov.count >= 4) {
-    const boards = points
-      .filter((p) => p.lane && !p.predicted)
-      .map((p) => p.lane!.board);
+    const boards = longestForwardLanePoints(points).map((p) => p.board);
     if (boards.length >= 4) {
       const sorted = [...boards].sort((a, b) => a - b);
       const med = sorted[Math.floor(sorted.length / 2)];
@@ -78,8 +157,42 @@ export function computeShotEstimate(
         arrowsBoard = null;
         delete extrapolated.arrows;
       }
+      // 單點貼溝但整體中位唔喺溝：15′ 誤鎖（33.6／35 類）
+      if (
+        arrowsBoard != null &&
+        (arrowsBoard <= 5 || arrowsBoard >= 32) &&
+        med >= 8 &&
+        med <= 30 &&
+        Math.abs(arrowsBoard - med) > 10
+      ) {
+        arrowsBoard = Math.round(med * 10) / 10;
+        extrapolated.arrows = true;
+      }
     }
   }
+
+  // mid-lane 假常數：arrows≈19.5±2 且前進段喺 12–20′ 幾乎無橫移、
+  // 但更深段有明顯 board 變化 → 改用深段回推／中位
+  if (arrowsBoard != null && cov && cov.maxFeet >= 24) {
+    const fwd = longestForwardLanePoints(points);
+    const early = fwd.filter((p) => p.feet >= 10 && p.feet <= 20);
+    const deep = fwd.filter((p) => p.feet >= 22 && p.feet <= Math.min(45, cov.maxFeet));
+    if (early.length >= 3 && deep.length >= 3) {
+      const eBoards = early.map((p) => p.board);
+      const dBoards = deep.map((p) => p.board);
+      const eSpan = Math.max(...eBoards) - Math.min(...eBoards);
+      const dMed = [...dBoards].sort((a, b) => a - b)[Math.floor(dBoards.length / 2)];
+      const nearMid = Math.abs(arrowsBoard - 19.5) <= 2.2;
+      if (nearMid && eSpan < 2.5 && Math.abs(dMed - arrowsBoard) > 4) {
+        const deepAt = boardAtFeet(points, Math.min(30, cov.maxFeet - 1));
+        if (deepAt != null && Math.abs(deepAt - 19.5) > 2.5) {
+          arrowsBoard = Math.round(deepAt * 10) / 10;
+          extrapolated.arrows = true;
+        }
+      }
+    }
+  }
+
   const entryBoard = arrowsBoard;
 
   // Breakpoint：只在覆蓋內找曲率；不足則 —（不預設 42′）
@@ -92,8 +205,14 @@ export function computeShotEstimate(
       maxGap: 3,
     });
     if (bp) {
-      breakpointBoard = bp.board;
-      breakpointDistance = Math.round(bpFeet * 10) / 10;
+      // 拒溝邊 BP（Tester 回歸：37.3@30′ 假常數）
+      if (bp.board >= 34.5 || bp.board <= 4.5) {
+        breakpointBoard = null;
+        breakpointDistance = null;
+      } else {
+        breakpointBoard = bp.board;
+        breakpointDistance = Math.round(bpFeet * 10) / 10;
+      }
     }
   }
 

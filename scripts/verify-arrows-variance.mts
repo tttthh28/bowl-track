@@ -1,6 +1,6 @@
 /**
- * Arrows：用幾何＋短探針揀角（貼 offline-metrics／Workbench 多幀），
- * 確認 arrowsBoard 有值、唔卡死常數、隨軌跡落喺合理 board。
+ * Arrows／BP：原生解析度 + 同 Workbench 連續幀探針（laneProbe）。
+ * 失敗：卡 33.6／21.3、多圈 sim variance 太低、BP 溝邊假常數。
  */
 import { execSync } from "child_process";
 import { readFileSync, mkdirSync } from "fs";
@@ -10,16 +10,22 @@ import {
   DEFAULT_TRACKER,
   rgbaToGray,
   trackBallFrame,
+  trackWorkSize,
+  scaleLaneCorners,
 } from "../src/lib/tracker.ts";
 import { detectLaneCorners, scoreLaneGeometry } from "../src/lib/laneDetect.ts";
 import { buildHomography, imageToLane } from "../src/lib/perspective.ts";
 import { computeShotEstimate } from "../src/lib/estimates.ts";
+import { pickBestCornersByProbe } from "../src/lib/laneProbe.ts";
 import type { LaneCorners } from "../src/lib/types.ts";
 
 const ROOT = join(import.meta.dirname, "..");
 const VIDEO = join(ROOT, "test-media/bowling-demo.mp4");
 const OUT = "/tmp/bowl-arrows-var";
-const W = 640, H = 576, FPS = 15, N = 130;
+const W = 1060,
+  H = 954,
+  FPS = 15,
+  N = 120;
 mkdirSync(OUT, { recursive: true });
 execSync(
   `ffmpeg -y -i "${VIDEO}" -vf "fps=${FPS},scale=${W}:${H}" -frames:v ${N} -f rawvideo -pix_fmt rgba "${OUT}/seq.rgba"`,
@@ -43,143 +49,254 @@ function frameAt(fi: number) {
   return u8;
 }
 
-function probeTrack(corners: LaneCorners) {
-  const Hm = buildHomography(corners);
-  if (!Hm) return { med: null as number | null, maxFeet: 0, minFeet: 99, locks: 0 };
+function downscale(
+  rgba: Uint8ClampedArray,
+  tw: number,
+  th: number
+): Uint8ClampedArray {
+  const out = new Uint8ClampedArray(tw * th * 4);
+  for (let y = 0; y < th; y++) {
+    const sy = Math.min(H - 1, Math.floor((y / th) * H));
+    for (let x = 0; x < tw; x++) {
+      const sx = Math.min(W - 1, Math.floor((x / tw) * W));
+      const si = (sy * W + sx) * 4;
+      const di = (y * tw + x) * 4;
+      out[di] = rgba[si];
+      out[di + 1] = rgba[si + 1];
+      out[di + 2] = rgba[si + 2];
+      out[di + 3] = 255;
+    }
+  }
+  return out;
+}
+
+function fullTrack(corners: LaneCorners) {
+  const Hm = buildHomography(corners)!;
+  const { scale, tw, th } = trackWorkSize(W, H);
+  const workC = scaleLaneCorners(corners, scale);
   const state = new BallTrackerState();
-  const boards: number[] = [];
-  let maxFeet = 0;
-  let minFeet = 99;
-  let locks = 0;
-  const nProbe = Math.min(Math.floor(raw.length / frameBytes), 110);
-  for (let f = 0; f < nProbe; f++) {
+  const pts: {
+    image: { x: number; y: number };
+    lane?: { board: number; feet: number };
+    t: number;
+    predicted?: boolean;
+  }[] = [];
+  for (let f = 0; f < N; f++) {
     const rgba = frameAt(f);
-    const copy = new Uint8ClampedArray(rgba);
-    const gray = rgbaToGray(copy, W, H);
-    const res = trackBallFrame(state, gray, W, H, settings, corners, 1000 / FPS, copy);
-    if (res.locked && res.smoothed) {
-      locks++;
-      const lane = imageToLane(Hm, res.smoothed);
-      if (lane.board >= 1.5 && lane.board <= 37.5) {
-        boards.push(lane.board);
-        if (lane.feet > maxFeet) maxFeet = lane.feet;
-        if (lane.feet < minFeet) minFeet = lane.feet;
+    const work =
+      scale < 1 ? downscale(rgba, tw, th) : new Uint8ClampedArray(rgba);
+    const gray = rgbaToGray(
+      work,
+      scale < 1 ? tw : W,
+      scale < 1 ? th : H
+    );
+    const res = trackBallFrame(
+      state,
+      gray,
+      scale < 1 ? tw : W,
+      scale < 1 ? th : H,
+      settings,
+      scale < 1 ? workC : corners,
+      1000 / FPS,
+      work
+    );
+    const pos = res.smoothed
+      ? scale < 1
+        ? { x: res.smoothed.x / scale, y: res.smoothed.y / scale }
+        : res.smoothed
+      : null;
+    if (res.locked && pos && (res.raw != null || res.predicted)) {
+      const lane = imageToLane(Hm, pos);
+      let accept = true;
+      if (
+        !res.predicted &&
+        (lane.board < 1.2 || lane.board > 37.8) &&
+        lane.feet < 45
+      ) {
+        accept = false;
+      }
+      if (accept && (pts.length > 0 || !res.predicted)) {
+        pts.push({
+          image: pos,
+          lane,
+          t: f * (1000 / FPS),
+          predicted: res.predicted || undefined,
+        });
       }
     }
   }
-  const med =
-    boards.length > 0
-      ? [...boards].sort((a, b) => a - b)[Math.floor(boards.length / 2)]
-      : null;
-  return { med, maxFeet, minFeet: boards.length ? minFeet : 99, locks };
+  return { pts, est: computeShotEstimate(pts as any) };
 }
 
-type Cand = { det: NonNullable<ReturnType<typeof detectLaneCorners>>; geom: number; fi: number };
+// Workbench-like multi-seek candidates
+const tryFi = [1, 5, 12, 21, 36, 48, 60, 75, 90, 100, 110];
+type Cand = {
+  det: NonNullable<ReturnType<typeof detectLaneCorners>>;
+  geom: number;
+  fi: number;
+};
 const cands: Cand[] = [];
-for (const fi of [0, 4, 8, 12, 16, 20, 24, 30, 40, 48]) {
+for (const fi of tryFi) {
+  if (fi >= N) continue;
   const det = detectLaneCorners(frameAt(fi), W, H);
   if (!det || det.confidence < 0.4) continue;
-  cands.push({ det, geom: scoreLaneGeometry(det, W, H), fi });
+  const geom = scoreLaneGeometry(det, W, H);
+  const corners = det.corners;
+  const botFrac = (corners.br.x - corners.bl.x) / W;
+  const midBot = (corners.bl.x + corners.br.x) / 2;
+  const midFrac = Math.abs(midBot / W - 0.5);
+  const widthOk =
+    botFrac >= 0.32 && botFrac <= 0.48
+      ? 28
+      : botFrac >= 0.28 && botFrac <= 0.52
+        ? 8
+        : -35;
+  const midOk = midFrac < 0.1 ? 22 : midFrac < 0.16 ? 6 : -30;
+  cands.push({ det, geom: geom + widthOk + midOk, fi });
 }
 cands.sort((a, b) => b.geom - a.geom);
-const top = cands.slice(0, Math.min(5, cands.length));
 
-let bestDet = top[0]?.det ?? null;
-let bestScore = -1e9;
-for (const c of top) {
-  const p = probeTrack(c.det.corners);
-  const botFrac = (c.det.corners.br.x - c.det.corners.bl.x) / W;
-  const medOk =
-    p.med != null && p.med >= 8 && p.med <= 30
-      ? 30
-      : p.med != null && p.med >= 5 && p.med <= 34
-        ? 10
-        : -40;
-  const coverOk = Math.min(40, Math.max(0, p.maxFeet - p.minFeet));
-  const earlyOk = p.minFeet <= 18 ? 25 : p.minFeet <= 24 ? 8 : -20;
-  const widePen = botFrac > 0.48 ? -25 : botFrac < 0.3 ? -10 : 0;
-  const score = c.geom + medOk + coverOk + earlyOk + widePen + Math.min(15, p.locks * 0.1);
+// Continuous frame buffer for probe (same idea as Workbench)
+const probeFrames = [];
+for (let f = 5; f < Math.min(N, 95); f++) {
+  probeFrames.push({ rgba: frameAt(f), width: W, height: H });
+}
+const picked = pickBestCornersByProbe(
+  cands.map((c) => ({ det: c.det, geomRank: c.geom })),
+  probeFrames,
+  5
+);
+assert(!!picked, "laneProbe picked corners");
+const corners = picked!.det.corners;
+console.log("chosen via laneProbe", {
+  score: picked!.detail.score.toFixed(1),
+  med: picked!.detail.med?.toFixed(1),
+  arr: picked!.detail.arrows?.toFixed(1),
+  ft: `${picked!.detail.minFeet.toFixed(1)}–${picked!.detail.maxFeet.toFixed(1)}`,
+  locks: picked!.detail.locks,
+  botFrac: ((corners.br.x - corners.bl.x) / W).toFixed(3),
+});
+assert(
+  picked!.detail.locks >= 8,
+  `probe actually locked (got ${picked!.detail.locks})`
+);
+
+const loopArrows: number[] = [];
+let basePts: Awaited<ReturnType<typeof fullTrack>>["pts"] | null = null;
+let baseEst: ReturnType<typeof computeShotEstimate> | null = null;
+for (let loop = 0; loop < 5; loop++) {
+  const { pts, est } = fullTrack(corners);
+  if (loop === 0) {
+    basePts = pts;
+    baseEst = est;
+  }
+  if (est.arrowsBoard != null) loopArrows.push(est.arrowsBoard);
   console.log(
-    `probe fi=${c.fi} geom=${c.geom.toFixed(1)} med=${p.med?.toFixed(1) ?? "—"} ft=${p.minFeet.toFixed(1)}–${p.maxFeet.toFixed(1)} bot=${botFrac.toFixed(2)} → ${score.toFixed(1)}`
+    `loop${loop + 1}: arrows=${est.arrowsBoard} bp=${est.breakpointBoard?.toFixed(1) ?? "—"}@${est.breakpointDistance ?? "—"} cov=${est.coverageFeetMin}–${est.coverageFeetMax} n=${pts.length}`
   );
-  if (score > bestScore) {
-    bestScore = score;
-    bestDet = c.det;
-  }
 }
 
-assert(!!bestDet, "have probed lane corners");
-const corners = bestDet!.corners;
-const botFrac = (corners.br.x - corners.bl.x) / W;
-const midBot = (corners.bl.x + corners.br.x) / 2;
-console.log("chosen corners", {
-  conf: (bestDet!.confidence * 100).toFixed(0) + "%",
-  botFrac: botFrac.toFixed(3),
-  midBot: midBot.toFixed(0),
-  TL: { x: Math.round(corners.tl.x), y: Math.round(corners.tl.y) },
-  TR: { x: Math.round(corners.tr.x), y: Math.round(corners.tr.y) },
-  BL: { x: Math.round(corners.bl.x), y: Math.round(corners.bl.y) },
-  BR: { x: Math.round(corners.br.x), y: Math.round(corners.br.y) },
-});
-assert(botFrac <= 0.5, `botFrac≤0.50 (got ${botFrac.toFixed(3)})`);
-assert(botFrac >= 0.3, `botFrac≥0.30 (got ${botFrac.toFixed(3)})`);
-assert(Math.abs(midBot - W * 0.5) / W < 0.16, `midBot near center (got ${midBot.toFixed(0)})`);
+assert(
+  !!baseEst && baseEst.arrowsBoard != null,
+  `arrows present (got ${baseEst?.arrowsBoard})`
+);
+assert(
+  baseEst!.arrowsBoard! >= 4 && baseEst!.arrowsBoard! <= 34,
+  `arrows in 4–34 (got ${baseEst!.arrowsBoard})`
+);
+assert(
+  Math.abs(baseEst!.arrowsBoard! - 33.6) > 0.35,
+  `arrows not stuck at 33.6 (got ${baseEst!.arrowsBoard})`
+);
+assert(
+  Math.abs(baseEst!.arrowsBoard! - 21.3) > 0.35,
+  `arrows not stuck at mid-lane 21.3 (got ${baseEst!.arrowsBoard})`
+);
+// UI 目標：近 13–14
+assert(
+  baseEst!.arrowsBoard! >= 6 && baseEst!.arrowsBoard! <= 20,
+  `arrows near expected band 6–20 (got ${baseEst!.arrowsBoard})`
+);
 
-// 完整追蹤 → arrows
-const Hm = buildHomography(corners)!;
-const state = new BallTrackerState();
-const pts: {
-  image: { x: number; y: number };
-  lane?: { board: number; feet: number };
-  t: number;
-}[] = [];
-for (let f = 0; f < N; f++) {
-  const rgba = frameAt(f);
-  const copy = new Uint8ClampedArray(rgba);
-  const gray = rgbaToGray(copy, W, H);
-  const res = trackBallFrame(state, gray, W, H, settings, corners, 1000 / FPS, copy);
-  if (res.locked && res.smoothed) {
-    const lane = imageToLane(Hm, res.smoothed);
-    if (lane.board >= 1 && lane.board <= 38) {
-      pts.push({ image: res.smoothed, lane, t: f * (1000 / FPS) });
-    }
+if (
+  baseEst!.coverageFeetMax != null &&
+  baseEst!.coverageFeetMax >= 28 &&
+  baseEst!.breakpointDistance != null
+) {
+  assert(
+    baseEst!.breakpointDistance > 18,
+    `BP feet not stuck near 15′ (got ${baseEst!.breakpointDistance}′)`
+  );
+}
+if (baseEst!.breakpointBoard != null) {
+  assert(
+    baseEst!.breakpointBoard < 34.5 && baseEst!.breakpointBoard > 4.5,
+    `BP board not gutter (got ${baseEst!.breakpointBoard})`
+  );
+}
+
+if (loopArrows.length >= 4) {
+  const allMid = loopArrows.every((a) => Math.abs(a - 21.3) <= 0.2);
+  const allGutter = loopArrows.every((a) => Math.abs(a - 33.6) <= 0.25);
+  assert(!allMid, `multi-loop not all ~21.3 (${loopArrows.join("/")})`);
+  assert(!allGutter, `multi-loop not all ~33.6 (${loopArrows.join("/")})`);
+  console.log(`multi-loop arrows=${loopArrows.join("/")}`);
+}
+
+assert(!!basePts && basePts.length >= 8, "enough points for shift test");
+const shiftOffsets = [-6, -3, 3, 6];
+const shiftArrows: number[] = [baseEst!.arrowsBoard!];
+const shiftPairs: { d: number; a: number }[] = [];
+for (const d of shiftOffsets) {
+  const shifted = basePts!.map((p) => ({
+    ...p,
+    lane: p.lane
+      ? {
+          board: Math.min(38, Math.max(1, p.lane.board + d)),
+          feet: p.lane.feet,
+        }
+      : undefined,
+  }));
+  const e = computeShotEstimate(shifted as any);
+  console.log(`shift ${d > 0 ? "+" : ""}${d}: arrows=${e.arrowsBoard}`);
+  if (e.arrowsBoard != null) {
+    shiftArrows.push(e.arrowsBoard);
+    shiftPairs.push({ d, a: e.arrowsBoard });
   }
 }
-const est = computeShotEstimate(pts as any);
-console.log("estimate", {
-  arrows: est.arrowsBoard,
-  foul: est.foulBoard,
-  cov: `${est.coverageFeetMin}–${est.coverageFeetMax}`,
-  bp: est.breakpointBoard,
-  avg: est.avgSpeedMph,
-  n: pts.length,
-});
+assert(shiftPairs.length >= 3, `enough shifted arrows (${shiftPairs.length}/4)`);
+const shiftSpan = Math.max(...shiftArrows) - Math.min(...shiftArrows);
+assert(
+  shiftSpan >= 6,
+  `shift variance span ${shiftSpan.toFixed(1)} need ≥6`
+);
+for (const { d, a } of shiftPairs) {
+  assert(
+    Math.abs(a - baseEst!.arrowsBoard!) >= 1.5,
+    `shift ${d}: moves (${baseEst!.arrowsBoard} → ${a})`
+  );
+}
 
-assert(est.arrowsBoard != null, `arrows present (got ${est.arrowsBoard})`);
-assert(
-  est.arrowsBoard! >= 4 && est.arrowsBoard! <= 34,
-  `arrows in 4–34 (got ${est.arrowsBoard})`
+const multiLoopSim: number[] = [];
+for (const d of [-5, -2.5, 0, 2.5, 5]) {
+  const shifted = basePts!.map((p) => ({
+    ...p,
+    lane: p.lane
+      ? {
+          board: Math.min(38, Math.max(1, p.lane.board + d)),
+          feet: p.lane.feet,
+        }
+      : undefined,
+  }));
+  const e = computeShotEstimate(shifted as any);
+  if (e.arrowsBoard != null) multiLoopSim.push(e.arrowsBoard);
+}
+assert(multiLoopSim.length >= 4, `multi-loop-sim count ${multiLoopSim.length}`);
+const simSpan = Math.max(...multiLoopSim) - Math.min(...multiLoopSim);
+console.log(
+  `multi-loop-sim arrows=${multiLoopSim.join("/")} span=${simSpan.toFixed(1)}`
 );
-// 唔好卡死舊 bug 常數 33.6
-assert(
-  Math.abs(est.arrowsBoard! - 33.6) > 0.2,
-  `arrows not stuck at 33.6 (got ${est.arrowsBoard})`
-);
-
-// 合成第二軌：把 board 平移，arrows 應跟住變
-const shifted = pts.map((p) => ({
-  ...p,
-  lane: p.lane
-    ? { board: Math.min(38, Math.max(1, p.lane.board + 4.5)), feet: p.lane.feet }
-    : undefined,
-}));
-const est2 = computeShotEstimate(shifted as any);
-console.log("shifted arrows", est2.arrowsBoard);
-assert(est2.arrowsBoard != null, "shifted arrows present");
-assert(
-  Math.abs(est2.arrowsBoard! - est.arrowsBoard!) > 2,
-  `arrows varies with board shift (${est.arrowsBoard} → ${est2.arrowsBoard})`
-);
+assert(simSpan >= 5, `multi-loop-sim variance too low (${simSpan.toFixed(1)})`);
 
 if (failed) {
   console.error(`\n${failed} arrows-variance asserts failed`);

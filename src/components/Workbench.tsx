@@ -21,6 +21,7 @@ import {
   frameHasLaneSignal,
   scoreLaneGeometry,
 } from "@/lib/laneDetect";
+import { pickBestCornersByProbe } from "@/lib/laneProbe";
 import {
   BallTrackerState,
   DEFAULT_TRACKER,
@@ -291,6 +292,8 @@ export default function Workbench() {
                   Math.min(dur * 0.42, dur - 0.12),
                   Math.min(dur * 0.58, dur - 0.12),
                   Math.min(dur * 0.72, dur - 0.12),
+                  Math.min(dur * 0.85, dur - 0.08),
+                  Math.min(dur * 0.92, dur - 0.06),
                   restoreT > 0.2 ? restoreT : dur * 0.2,
                 ].map((x) =>
                   Math.max(0, Math.min(x, Math.max(0, dur - 0.06)))
@@ -337,28 +340,72 @@ export default function Workbench() {
         if (sc >= 92 && next.confidence >= 0.65) break;
       }
       // 多候選再排：單道寬＋中線近中央（避 geom 高但底邊吞鄰道／人 → arrows 卡 ~33.6）
-      if (detCands.length >= 2) {
-        const vw = v.videoWidth || 1;
-        let bestRank = -1e9;
-        for (const c of detCands) {
-          const corners = c.det.corners;
-          const botW = corners.br.x - corners.bl.x;
-          const botFrac = botW / vw;
-          const midBot = (corners.bl.x + corners.br.x) / 2;
-          const midFrac = Math.abs(midBot / vw - 0.5);
-          const widthOk =
-            botFrac >= 0.32 && botFrac <= 0.48
-              ? 28
-              : botFrac >= 0.28 && botFrac <= 0.52
-                ? 8
-                : -35;
-          const midOk = midFrac < 0.1 ? 22 : midFrac < 0.16 ? 6 : -30;
-          const rank = c.geom + widthOk + midOk;
-          if (rank > bestRank) {
-            bestRank = rank;
-            result = c.det;
-            bestScore = rank;
+      const vw = v.videoWidth || 1;
+      type Ranked = DetCand & { rank: number };
+      const ranked: Ranked[] = detCands.map((c) => {
+        const corners = c.det.corners;
+        const botW = corners.br.x - corners.bl.x;
+        const botFrac = botW / vw;
+        const midBot = (corners.bl.x + corners.br.x) / 2;
+        const midFrac = Math.abs(midBot / vw - 0.5);
+        const widthOk =
+          botFrac >= 0.32 && botFrac <= 0.48
+            ? 28
+            : botFrac >= 0.28 && botFrac <= 0.52
+              ? 8
+              : -35;
+        const midOk = midFrac < 0.1 ? 22 : midFrac < 0.16 ? 6 : -30;
+        return { ...c, rank: c.geom + widthOk + midOk };
+      });
+      ranked.sort((a, b) => b.rank - a.rank);
+      if (ranked.length >= 1) {
+        result = ranked[0].det;
+        bestScore = ranked[0].rank;
+      }
+
+      // 上傳片：先抓連續幀 buffer（~15fps），再用共用探針揀角
+      // （舊版疏 seek 會令 tracker 永不 lock → 探針形同虛設 → UI 仍用幾何角 → arrows~21）
+      let probeNote = "";
+      if (isUpload && dur > 0 && ranked.length >= 1) {
+        const probeFps = 15;
+        const probeN = Math.min(90, Math.max(40, Math.floor(Math.min(dur, 6.5) * probeFps)));
+        const t0 = Math.min(0.35, Math.max(0.08, dur * 0.04));
+        const frames: { rgba: Uint8ClampedArray; width: number; height: number }[] = [];
+        for (let i = 0; i < probeN; i++) {
+          const tP = Math.min(dur - 0.06, t0 + i / probeFps);
+          await seekTo(tP);
+          const canvas = grabFrameToCanvas();
+          if (!canvas) continue;
+          const ctx = canvas.getContext("2d", { willReadFrequently: true });
+          if (!ctx) continue;
+          const img = ctx.getImageData(0, 0, canvas.width, canvas.height);
+          if (!frameHasLaneSignal(img.data, canvas.width, canvas.height)) continue;
+          // 拷貝，避免 ImageData 被下一幀覆寫
+          frames.push({
+            rgba: new Uint8ClampedArray(img.data),
+            width: canvas.width,
+            height: canvas.height,
+          });
+        }
+        if (frames.length >= 20) {
+          const picked = pickBestCornersByProbe(
+            ranked.map((c) => ({ det: c.det, geomRank: c.rank })),
+            frames,
+            5
+          );
+          if (picked) {
+            result = picked.det;
+            bestScore = picked.detail.score;
+            probeNote = ` · 探針${frames.length}幀 arr=${
+              picked.detail.arrows != null
+                ? picked.detail.arrows.toFixed(1)
+                : "—"
+            } med=${
+              picked.detail.med != null ? picked.detail.med.toFixed(1) : "—"
+            }`;
           }
+        } else {
+          probeNote = ` · 探針幀不足(${frames.length})`;
         }
       }
 
@@ -389,7 +436,7 @@ export default function Workbench() {
       }
       persistCorners(result!.corners);
       setDetectMsg(
-        `${result!.message}（信心 ${(result!.confidence * 100).toFixed(0)}% · ${attempts}幀）`
+        `${result!.message}（信心 ${(result!.confidence * 100).toFixed(0)}% · ${attempts}幀${probeNote}）`
       );
       setStatus(
         result!.confidence >= 0.55
