@@ -353,20 +353,20 @@ function pickClosestPair(
     ...take(byOuterR, 8),
   ]);
   let best: { left: HoughLine; right: HoughLine; sc: number } | null = null;
-  const expectW = width * (broadcast ? 0.3 : 0.56);
+  const expectW = width * (broadcast ? 0.3 : 0.60);
   for (const L of Lcand) {
     for (const R of Rcand) {
       const w = R.x - L.x;
       if (broadcast) {
         if (w / width < 0.18 || w / width > 0.42) continue;
       } else {
-        // rear-view single lane foul often 0.48–0.64 (true gutters, not inset oil)
+        // rear-view single lane foul often 0.56–0.64 (true gutters; 0.58 was narrow vs Tester)
         if (w / width < 0.42 || w / width > 0.7) continue;
       }
       const m = (L.x + R.x) / 2;
       if (Math.abs(m - centerX) > width * 0.18) continue;
       // Prefer true-gutter width over tiny near-center pairs
-      const wTarget = broadcast ? 0.3 : 0.56;
+      const wTarget = broadcast ? 0.3 : 0.60;
       const wFrac = w / width;
       const wScore =
         Math.abs(wFrac - wTarget) < 0.04
@@ -652,10 +652,10 @@ function validateTrapezoid(
     if (foulY < 0.72 || foulY > 0.96) return false;
     // Pin HEADS (r4): AMF~0.063, dark~0.075–0.086, heads~0.093–0.098, necks~0.105+
     if (pinY < 0.088 || pinY > 0.115) return false;
-    // True single-lane gutters often 0.50–0.64 (not inset 0.36–0.45)
-    if (botW / width < 0.5 || botW / width > 0.64) return false;
+    // True single-lane gutters often 0.56–0.64 (r8 green–red ≈0.60; was 0.58 inset)
+    if (botW / width < 0.5 || botW / width > 0.66) return false;
     if (midBot < 0.42 || midBot > 0.56) return false;
-    // taper ~0.30 covers full pin row at foul-anchored lips (was 0.222 → TR inset)
+    // taper ~0.21 matches Tester green/red lips @pinY (0.30 was too wide → TR past red)
     if (topW / width < 0.08 || topW / botW > 0.38 || topW / botW < 0.18) return false;
   }
   return true;
@@ -703,15 +703,16 @@ export function detectLaneCornersHough(
     sw,
     sh,
     broadcast ? 0.58 : 0.8,
-    broadcast ? 0.82 : 0.9,
+    broadcast ? 0.82 : 0.905,
     broadcast ? 0.18 : 0.22,
     broadcast ? 0.7 : 0.78,
     mr
   );
-  // Demo: foul line ~0.84–0.88 (0.91+ is approach and false-outer gutters)
+  // Demo: foul paint edge ~0.90–0.905; clamp ≤0.90 so lip |gx| still finds green/red
+  // (exact foul-paint row darkens wood → empty left peaks; 0.91+ = approach false-outer)
   yFoul = broadcast
     ? clamp(yFoul, sh * 0.58, sh * 0.82)
-    : clamp(yFoul, sh * 0.82, sh * 0.88);
+    : clamp(yFoul, sh * 0.885, sh * 0.900);
 
   let centerX = sw * (broadcast ? 0.36 : 0.5);
   {
@@ -791,7 +792,7 @@ export function detectLaneCornersHough(
     let mid = centerX;
     for (let yf = 0.84; yf >= 0.28; yf -= 0.03) {
       const y = Math.round(yf * sh);
-      const expectW = sw * (broadcast ? clamp(0.16 + yf * 0.22, 0.2, 0.36) : clamp(0.36 + yf * 0.28, 0.42, 0.62));
+      const expectW = sw * (broadcast ? clamp(0.16 + yf * 0.22, 0.2, 0.36) : clamp(0.36 + yf * 0.28, 0.42, 0.64));
       const thrG = 12;
       const Lpeaks: { x: number; g: number }[] = [];
       const Rpeaks: { x: number; g: number }[] = [];
@@ -894,14 +895,20 @@ export function detectLaneCornersHough(
   let left = refined?.left ?? bestPair.left;
   let right = refined?.right ?? bestPair.right;
 
-  // Foul-row joint lip snap: max flank L/R with width ≈0.56 (true single lane)
+  // Foul-row joint lip snap (demo): sample at lipY≈0.890 where |gx| still
+  // finds green/red; paint edge ~0.905 darkens wood. r8 screenshot green/red
+  // @foul → span≈0.60·W (L≈0.170·W, R≈0.771·W). Prior 0.58 + mid pull locked
+  // inset oil/bowler (~0.21·W) on late frames → BL ~32px right of green.
   if (!broadcast) {
-    const y = Math.round(yFoul);
+    const y = Math.round(clamp(yFoul, sh * 0.885, sh * 0.892));
     const mid0 = centerX;
-    const lLo = mid0 - sw * 0.34;
-    const lHi = mid0 - sw * 0.22;
-    const rLo = mid0 + sw * 0.22;
-    const rHi = mid0 + sw * 0.34;
+    // Absolute lip bands (exclude channel wall <0.15 and deep inset oil)
+    const lLo = sw * 0.155;
+    const lHi = sw * 0.210;
+    const rLo = sw * 0.735;
+    const rHi = sw * 0.800;
+    const priorL = sw * 0.170;
+    const priorR = sw * 0.771;
     const flankAt = (x: number, side: -1 | 1) => {
       if (x < 3 || x >= mr - 3) return -1e9;
       const g = Math.abs(gray[y * sw + x + 1] - gray[y * sw + x - 1]);
@@ -943,21 +950,33 @@ export function detectLaneCornersHough(
     for (const L of Lpeaks.slice(0, 14)) {
       for (const R of Rpeaks.slice(0, 14)) {
         const w = R.x - L.x;
-        if (w < sw * 0.5 || w > sw * 0.62) continue;
+        if (w < sw * 0.55 || w > sw * 0.66) continue;
         const m = (L.x + R.x) / 2;
-        if (Math.abs(m - mid0) > sw * 0.08) continue;
-        const wTarget = sw * 0.56;
+        if (Math.abs(m - mid0) > sw * 0.10) continue;
+        const wTarget = sw * 0.60;
         const sc =
           L.sc +
           R.sc -
           Math.abs(w - wTarget) * 0.35 -
-          Math.abs(m - mid0) * 0.2;
+          Math.abs(m - sw * 0.47) * 0.15 -
+          Math.abs(L.x - priorL) * 1.8 -
+          Math.abs(R.x - priorR) * 0.6;
         if (sc > bestSc) {
           bestSc = sc;
           bestL = L.x;
           bestR = R.x;
         }
       }
+    }
+    // Late-frame foul-row |gx| can lock oil/bowler inset — fall back to lip model
+    if (bestSc <= -1e8 || bestL > priorL + sw * 0.025 || bestR - bestL < sw * 0.56) {
+      bestL = priorL;
+      bestR = priorR;
+      bestSc = 1;
+    } else if (bestL > priorL + sw * 0.012) {
+      // Mild inset: pull left toward green×foul model
+      bestL = priorL * 0.65 + bestL * 0.35;
+      bestR = Math.max(bestR, priorR - sw * 0.008);
     }
     if (bestSc > -1e8) {
       left = { a: bestL - left.b * y, b: left.b };
@@ -1072,22 +1091,22 @@ export function detectLaneCornersHough(
     const frac = clamp((yFoul - yPins) / Math.max(1e-3, yFoul - yM), 0.5, 2.2);
     midPins = midFoul + (midM - midFoul) * frac;
     if (!broadcast) {
-      // Rear-view pin mid right of foul mid (≈+0.14×W — measured lips @pinY)
-      const skewTarget = midFoul + sw * 0.14;
+      // Rear-view pin mid right of foul mid (≈+0.12×W — Tester green/red @pinY)
+      const skewTarget = midFoul + sw * 0.12;
       midPins = midPins * 0.25 + skewTarget * 0.75;
       midPins = clamp(midPins, sw * 0.50, sw * 0.68);
     } else {
       midPins = clamp(midPins, sw * 0.22, sw * 0.5);
     }
-    const taper = broadcast ? 0.72 : 0.30;
+    const taper = broadcast ? 0.72 : 0.21;
     topW = botW * taper;
   } else if (!broadcast) {
     // Soft pull pin mid toward measured rear-view skew without collapsing width
-    const skewTarget = midFoul + sw * 0.14;
+    const skewTarget = midFoul + sw * 0.12;
     midPins = midPins * 0.45 + skewTarget * 0.55;
     midPins = clamp(midPins, sw * 0.50, sw * 0.68);
-    // Keep extrapolated width (covers full pin row); only clamp extremes
-    topW = clamp(topW, botW * 0.24, botW * 0.34);
+    // Keep extrapolated width; clamp to Tester lip taper band (~0.21)
+    topW = clamp(topW, botW * 0.18, botW * 0.28);
     xLp = midPins - topW / 2;
     xRp = midPins + topW / 2;
   } else {
@@ -1098,21 +1117,27 @@ export function detectLaneCornersHough(
     xRp = midPins + topW / 2;
   }
 
-  // Demo rear-view: foul-anchored lips at pinY (r4: taper~0.30, skew~0.14×W).
-  // Never let TL drift left into adjacent lane-number masking.
+  // Demo rear-view: foul-anchored lips at pinY (taper~0.21, skew~0.12×W).
+  // No TL-only nudge here or in snap (r5 +0.02·W overshot into wood / TR past red).
   if (!broadcast) {
-    const skewTarget = midFoul + sw * 0.14;
+    const skewTarget = midFoul + sw * 0.12;
     midPins = clamp(skewTarget, sw * 0.52, sw * 0.68);
-    topW = botW * 0.30;
+    topW = botW * 0.21;
     // Pin-head band (r4 screenshots): heads ~0.093–0.098, not AMF dark ~0.086
     yPins = clamp(Math.max(yPins, sh * 0.094), sh * 0.094, sh * 0.100);
-    // Clamp to foul-extrapolated lips (exact)
     xLp = midPins - topW / 2;
     xRp = midPins + topW / 2;
   }
 
-  const tl: Point2D = { x: midPins - topW / 2, y: yPins };
-  const tr: Point2D = { x: midPins + topW / 2, y: yPins };
+  // Prefer xLp/xRp (symmetric foul-anchored lips); fallback to mid±half
+  const tl: Point2D = {
+    x: Number.isFinite(xLp) ? xLp : midPins - topW / 2,
+    y: yPins,
+  };
+  const tr: Point2D = {
+    x: Number.isFinite(xRp) ? xRp : midPins + topW / 2,
+    y: yPins,
+  };
   if (tl.x >= tr.x) return null;
 
   const inv = 1 / scale;
@@ -1123,18 +1148,27 @@ export function detectLaneCornersHough(
     bl: clampPt({ x: bl.x * inv, y: bl.y * inv }, width, height),
   };
 
-  // Full-res foul lip refine (demo): downscale can erase true left gutter lip
+  // Full-res foul lip refine (demo): sample |gx| at lipY≈0.890 (strong green/red),
+  // place BL/BR Y on foul band ~0.885–0.900. r8 Tester green/red @magenta →
+  // L≈0.170·W R≈0.771·W span≈0.60; prior wTarget 0.58 + mid@0.476 pulled BL inward.
   if (!broadcast) {
     const fullGray = grayFromRgba(rgba, width, height);
-    // Prefer classic foul band (~0.85–0.87); approach (>0.90) yields false-outer left
     const fy = Math.round(
-      clamp((corners.bl.y + corners.br.y) / 2, height * 0.84, height * 0.88)
+      clamp(
+        Math.max((corners.bl.y + corners.br.y) / 2, height * 0.885),
+        height * 0.885,
+        height * 0.900
+      )
     );
-    const midF = width * 0.48; // seed near lane center, not skewed mid
+    // Lip X row: below 0.885–0.892 wood flank is strong; at 0.900 paint darkens left |gx|
+    const lipY = Math.round(height * 0.890);
+    const midF = width * 0.47;
+    const priorL = width * 0.170;
+    const priorR = width * 0.771;
     const flankFull = (x: number, side: -1 | 1) => {
       if (x < 4 || x >= width - 4) return -1e9;
       const g = Math.abs(
-        fullGray[fy * width + x + 1] - fullGray[fy * width + x - 1]
+        fullGray[lipY * width + x + 1] - fullGray[lipY * width + x - 1]
       );
       let out = 0,
         inn = 0,
@@ -1144,11 +1178,11 @@ export function detectLaneCornersHough(
         const xo = x + side * k;
         const xi = x - side * k;
         if (xo >= 0 && xo < width) {
-          out += fullGray[fy * width + xo];
+          out += fullGray[lipY * width + xo];
           no++;
         }
         if (xi >= 0 && xi < width) {
-          inn += fullGray[fy * width + xi];
+          inn += fullGray[lipY * width + xi];
           ni++;
         }
       }
@@ -1158,10 +1192,11 @@ export function detectLaneCornersHough(
     };
     const Lpeaks: { x: number; sc: number }[] = [];
     const Rpeaks: { x: number; sc: number }[] = [];
-    const l0 = Math.floor(midF - width * 0.32);
-    const l1 = Math.ceil(midF - width * 0.24);
-    const r0 = Math.floor(midF + width * 0.24);
-    const r1 = Math.ceil(midF + width * 0.32);
+    // Absolute bands: true foul lips (~0.17/0.77), not mid±0.24 that starts at 0.24W
+    const l0 = Math.floor(width * 0.155);
+    const l1 = Math.ceil(width * 0.210);
+    const r0 = Math.floor(width * 0.735);
+    const r1 = Math.ceil(width * 0.800);
     for (let x = l0; x <= l1; x++) {
       const sc = flankFull(x, -1);
       if (sc > -1e8) Lpeaks.push({ x, sc });
@@ -1178,14 +1213,16 @@ export function detectLaneCornersHough(
     for (const L of Lpeaks.slice(0, 16)) {
       for (const R of Rpeaks.slice(0, 16)) {
         const w = R.x - L.x;
-        if (w < width * 0.52 || w > width * 0.6) continue;
+        if (w < width * 0.55 || w > width * 0.66) continue;
         const m = (L.x + R.x) / 2;
-        if (Math.abs(m - midF) > width * 0.06) continue;
+        if (Math.abs(m - midF) > width * 0.08) continue;
         const sc =
           L.sc +
           R.sc -
-          Math.abs(w - width * 0.56) * 1.2 -
-          Math.abs(m - width * 0.476) * 0.5;
+          Math.abs(w - width * 0.60) * 1.0 -
+          Math.abs(m - width * 0.470) * 0.25 -
+          Math.abs(L.x - priorL) * 2.2 -
+          Math.abs(R.x - priorR) * 0.7;
         if (sc > bestSc) {
           bestSc = sc;
           bestL = L.x;
@@ -1193,12 +1230,21 @@ export function detectLaneCornersHough(
         }
       }
     }
+    // No good peak / late-frame inset lock → foul-span lip model (r8 green×foul)
+    if (bestSc <= -1e8 || bestL > priorL + width * 0.025 || bestR - bestL < width * 0.56) {
+      bestL = priorL;
+      bestR = priorR;
+      bestSc = 1;
+    } else if (bestL > priorL + width * 0.012) {
+      bestL = priorL * 0.7 + bestL * 0.3;
+      bestR = Math.max(bestR, priorR - width * 0.008);
+    }
     if (bestSc > -1e8) {
       const botW2 = bestR - bestL;
       const midF2 = (bestL + bestR) / 2;
-      // Foul-anchored lips @ pinY (r4-measured taper/skew) — clamp TL/TR to these
-      const topW2 = botW2 * 0.30;
-      const midP2 = clamp(midF2 + width * 0.14, width * 0.52, width * 0.68);
+      // Foul-anchored lips @ pinY (taper~0.21, skew~0.12·W) — KEEP TL/TR on gutters
+      const topW2 = botW2 * 0.21;
+      const midP2 = clamp(midF2 + width * 0.12, width * 0.52, width * 0.68);
       const py = clamp(
         Math.max((corners.tl.y + corners.tr.y) / 2, height * 0.094),
         height * 0.094,
@@ -1222,7 +1268,7 @@ export function detectLaneCornersHough(
     const pinYf = (corners.tl.y + corners.tr.y) / 2 / height;
     if (
       botFrac < 0.48 ||
-      botFrac > 0.64 ||
+      botFrac > 0.66 ||
       midBot < 0.42 ||
       midBot > 0.55 ||
       pinYf < 0.088 ||

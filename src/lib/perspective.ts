@@ -75,18 +75,45 @@ export function buildHomography(corners: LaneCorners): Homography | null {
 }
 
 /**
- * Track／homography 用四角：保留 foul 真溝，pins 端去 skew（pin mid → foul mid）。
+ * Track／homography 用四角（顯示四角唔改 — Tony 視覺 bar / r9 真溝）。
  *
- * 視覺四角可鎖真溝（foul≈208/802、pins≈562/694 midP≈0.59），但強 pin skew
- * 會令 pointInLane 拒球＋feet 壓縮 → arr≈11.8。映射梯形用 midF + top≈0.18×W
- * 恢復 board/feet，顯示四角唔改（Tony 視覺 bar）。
+ * 1) pins 去 skew：pin mid → foul mid（避 pointInLane 拒球＋feet 壓縮）
+ * 2) 全溝 foul（botFrac>0.52）：映射底內縮到 0.50×W、頂 0.16×W
+ *    （r9 真溝 bot≈0.59 若沿用顯示底 → arr/med 塌到 ~4–5；0.50/0.16 → path@15′∈[13,15]）
+ * 3) 已內縮 foul（botFrac≤0.52）：保留 foul，只去 pin skew（legacy top≈0.18×W）
  */
-export function mappingCornersForTrack(corners: LaneCorners): LaneCorners {
+export function mappingCornersForTrack(
+  corners: LaneCorners,
+  frameWidth?: number
+): LaneCorners {
   const midF = (corners.bl.x + corners.br.x) / 2;
   const botW = Math.max(8, corners.br.x - corners.bl.x);
-  // bot≈0.56×W 時 topFrac≈0.18 → 探針 arr∈[13,15] 且 span 穩
-  const topW = botW * (0.18 / 0.56);
   const pinY = (corners.tl.y + corners.tr.y) / 2;
+  const foulY = (corners.bl.y + corners.br.y) / 2;
+  const xMax = Math.max(corners.bl.x, corners.br.x, corners.tl.x, corners.tr.x);
+  // Prefer real frame width; fallback ≈ BR / 0.77 (demo rear-view red lip)
+  // Fallback: BR≈0.77W on demo rear-view; never use botW/0.5 (that forces botFrac=0.5
+  // and skips the full-gutter inset path when width is omitted).
+  const W = Math.max(
+    64,
+    frameWidth && frameWidth > 0 ? frameWidth : Math.max(xMax / 0.77, botW / 0.62)
+  );
+  const botFrac = botW / W;
+  // Calibrated on bowling-demo r9 display (BL184/BR810 @1060): arr=path@15′=13.0
+  const MAP_BOT = 0.5;
+  const MAP_TOP = 0.16;
+  if (botFrac > 0.52) {
+    const mapBotW = MAP_BOT * W;
+    const mapTopW = MAP_TOP * W;
+    return {
+      bl: { x: midF - mapBotW / 2, y: foulY },
+      br: { x: midF + mapBotW / 2, y: foulY },
+      tl: { x: midF - mapTopW / 2, y: pinY },
+      tr: { x: midF + mapTopW / 2, y: pinY },
+    };
+  }
+  // Legacy inset foul: keep display BL/BR, de-skew pins only
+  const topW = botW * (0.18 / 0.56);
   return {
     bl: { ...corners.bl },
     br: { ...corners.br },
@@ -95,9 +122,12 @@ export function mappingCornersForTrack(corners: LaneCorners): LaneCorners {
   };
 }
 
-/** 顯示四角 → 追蹤／估計用 H（去 pin skew） */
-export function buildTrackHomography(corners: LaneCorners): Homography | null {
-  return buildHomography(mappingCornersForTrack(corners));
+/** 顯示四角 → 追蹤／估計用 H（去 pin skew；全溝時內縮 mapping bot） */
+export function buildTrackHomography(
+  corners: LaneCorners,
+  frameWidth?: number
+): Homography | null {
+  return buildHomography(mappingCornersForTrack(corners, frameWidth));
 }
 
 export function applyHomography(H: Homography, p: Point2D): Point2D {

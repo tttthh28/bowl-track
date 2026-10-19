@@ -117,7 +117,7 @@ const L15 = { foulL: 208, foulR: 802, pinsL: 550, pinsR: 698 }; // at pinY≈0.0
     const det = detectLaneCorners(rgba, W, H);
     const arr = det ? scoreCornersByProbe(det.corners, probeFrames).arrows : null;
     const mapArr = det
-      ? scoreCornersByProbe(mappingCornersForTrack(det.corners), probeFrames).arrows
+      ? scoreCornersByProbe(det.corners, probeFrames).arrows
       : null;
     const c = det?.corners;
     const foulDxL = c ? c.bl.x - L15.foulL : null;

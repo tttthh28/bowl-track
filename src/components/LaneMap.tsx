@@ -64,8 +64,12 @@ const PIN_DECK: PinDef[] = (() => {
   }));
 })();
 
-/** Feet threshold: path end / pocket counts as “near pins” for highlight */
+/** Feet threshold: path end counts as “reached pins” for highlight / 擊 */
 const NEAR_PINS_FEET = 50;
+/** Extrapolate heading to this feet (pocket / pin-1 zone ≈58–60′) */
+const PIN_DECK_TARGET_FEET = 58.5;
+/** Min feet span on trailing segment before trusting slope extrapolate */
+const MIN_EXTRAP_SPAN_FEET = 3;
 /** Board distance to treat as “hit / nearest” (≈ half pin gap) */
 const HIT_BOARD_TOL = PIN_GAP_BOARDS * 0.55;
 
@@ -82,16 +86,71 @@ function nearestPin(board: number): PinDef {
   return best;
 }
 
-/** Impact board from path end (if near pin deck) or pocketBoard. */
-function impactBoardFromPath(pts: LanePoint[]): number | null {
+type ImpactMode = "reached" | "extrap" | "fallback";
+type ImpactInfo = { board: number; mode: ImpactMode };
+
+/**
+ * Linear board@feet from a trailing segment with positive feet advance.
+ * Returns null if path too short / noisy to trust the slope.
+ */
+function extrapolateBoardToFeet(
+  pts: LanePoint[],
+  targetFeet: number
+): number | null {
+  if (pts.length < 2) return null;
+  const last = pts[pts.length - 1];
+  if (last.feet >= targetFeet) return last.board;
+
+  // Prefer a trailing anchor with enough feet span
+  let a: LanePoint | null = null;
+  let b: LanePoint = last;
+  for (let i = pts.length - 2; i >= 0; i--) {
+    const span = last.feet - pts[i].feet;
+    if (span >= MIN_EXTRAP_SPAN_FEET) {
+      a = pts[i];
+      break;
+    }
+  }
+  // Short but usable: last two points with clear forward feet
+  if (!a) {
+    for (let i = pts.length - 1; i >= 1; i--) {
+      const span = pts[i].feet - pts[i - 1].feet;
+      if (span >= 1.5) {
+        a = pts[i - 1];
+        b = pts[i];
+        break;
+      }
+    }
+  }
+  if (!a) return null;
+  const dFeet = b.feet - a.feet;
+  if (dFeet < 0.5) return null;
+  const slope = (b.board - a.board) / dFeet;
+  const board = b.board + slope * (targetFeet - b.feet);
+  if (!Number.isFinite(board)) return null;
+  // Unstable if heading flies well off the 39-board lane → caller falls back
+  if (board < -2 || board > LANE_W + 2) return null;
+  return board;
+}
+
+/**
+ * Impact / heading board for pin highlight:
+ * 1) path point with feet ≥ ~50 (reached pin zone)
+ * 2) else extrapolate last segment to pin-deck feet (~58.5′)
+ * 3) else last point’s board (column → nearest pin, still「近」)
+ */
+function impactFromPath(pts: LanePoint[]): ImpactInfo | null {
   if (!pts.length) return null;
   const end = pts[pts.length - 1];
-  if (end.feet >= NEAR_PINS_FEET) return end.board;
-  // Prefer last point with feet in pin zone
+  if (end.feet >= NEAR_PINS_FEET) return { board: end.board, mode: "reached" };
   for (let i = pts.length - 1; i >= 0; i--) {
-    if (pts[i].feet >= NEAR_PINS_FEET) return pts[i].board;
+    if (pts[i].feet >= NEAR_PINS_FEET) {
+      return { board: pts[i].board, mode: "reached" };
+    }
   }
-  return null;
+  const extrap = extrapolateBoardToFeet(pts, PIN_DECK_TARGET_FEET);
+  if (extrap != null) return { board: extrap, mode: "extrap" };
+  return { board: end.board, mode: "fallback" };
 }
 
 /**
@@ -153,7 +212,7 @@ export default function LaneMap({
     return d;
   };
 
-  /** Highlighted pin nums + primary label from live / latest shot near pins */
+  /** Highlighted pin nums + primary label from live / latest shot (incl. short-track heading) */
   const { highlightNums, primaryPin, primaryLabel } = useMemo(() => {
     const hit = new Map<number, { dist: number; fromLive: boolean }>();
 
@@ -168,10 +227,24 @@ export default function LaneMap({
       }
     };
 
-    // Live path end
-    consider(impactBoardFromPath(livePath), true);
+    const labelFor = (
+      board: number,
+      mode: ImpactMode | "pocket"
+    ): string => {
+      const pin = nearestPin(board);
+      const d = Math.abs(board - pin.board);
+      // 「擊」only when path/pocket clearly at pin; short-track extrap/fallback →「近」
+      const canHit =
+        (mode === "reached" || mode === "pocket") &&
+        d <= HIT_BOARD_TOL * 0.35;
+      return canHit ? `擊 #${pin.num}` : `近 #${pin.num}`;
+    };
 
-    // Shots: pocketBoard preferred, else path end near pins (latest shot first)
+    // Live path: reached pins OR extrapolate / last-board heading
+    const liveImpact = impactFromPath(livePath);
+    if (liveImpact) consider(liveImpact.board, true);
+
+    // Shots: pocketBoard preferred, else path impact (incl. short extrap)
     for (let si = shots.length - 1; si >= 0; si--) {
       const shot = shots[si];
       const pocket = shot.estimate?.pocketBoard ?? null;
@@ -179,7 +252,8 @@ export default function LaneMap({
         consider(pocket, false);
       } else {
         const pts = shot.points.filter((p) => p.lane).map((p) => p.lane!);
-        consider(impactBoardFromPath(pts), false);
+        const info = impactFromPath(pts);
+        if (info) consider(info.board, false);
       }
     }
 
@@ -187,30 +261,25 @@ export default function LaneMap({
     // Primary = live hit if any, else closest / latest
     let primary: PinDef | null = null;
     let label = "";
-    if (livePath.length) {
-      const b = impactBoardFromPath(livePath);
-      if (b != null) {
-        const pin = nearestPin(b);
-        if (nums.has(pin.num)) {
-          primary = pin;
-          const d = Math.abs(b - pin.board);
-          label = d <= HIT_BOARD_TOL * 0.35 ? `擊 #${pin.num}` : `近 #${pin.num}`;
-        }
-      }
+    if (liveImpact && nums.has(nearestPin(liveImpact.board).num)) {
+      primary = nearestPin(liveImpact.board);
+      label = labelFor(liveImpact.board, liveImpact.mode);
     }
     if (!primary && shots.length) {
       const shot = shots[shots.length - 1];
-      const b =
-        shot.estimate?.pocketBoard ??
-        impactBoardFromPath(
-          shot.points.filter((p) => p.lane).map((p) => p.lane!)
-        );
-      if (b != null) {
-        const pin = nearestPin(b);
+      const pocket = shot.estimate?.pocketBoard ?? null;
+      if (pocket != null && Number.isFinite(pocket)) {
+        const pin = nearestPin(pocket);
         if (nums.has(pin.num)) {
           primary = pin;
-          const d = Math.abs(b - pin.board);
-          label = d <= HIT_BOARD_TOL * 0.35 ? `擊 #${pin.num}` : `近 #${pin.num}`;
+          label = labelFor(pocket, "pocket");
+        }
+      } else {
+        const pts = shot.points.filter((p) => p.lane).map((p) => p.lane!);
+        const info = impactFromPath(pts);
+        if (info && nums.has(nearestPin(info.board).num)) {
+          primary = nearestPin(info.board);
+          label = labelFor(info.board, info.mode);
         }
       }
     }
@@ -302,36 +371,6 @@ export default function LaneMap({
             </g>
           );
         })}
-        {/* 箭嘴位置：經典 7 箭 @15′（boards 5/10/15/20/25/30/35） */}
-        <g aria-label="箭嘴 15呎">
-          {ARROW_BOARDS.map((b) => {
-            const x = padL + (b / LANE_W) * innerW;
-            const y = feetToY(ARROWS_FEET);
-            // 小三角指向 foul（圖下方），似真實球道箭嘴
-            const s = 3.2;
-            const d = `M${x.toFixed(1)},${(y + s).toFixed(1)} L${(x - s * 0.7).toFixed(1)},${(y - s * 0.55).toFixed(1)} L${(x + s * 0.7).toFixed(1)},${(y - s * 0.55).toFixed(1)} Z`;
-            return (
-              <path
-                key={`arr-${b}`}
-                d={d}
-                fill="#94a3b8"
-                fillOpacity={0.9}
-                stroke="#cbd5e1"
-                strokeWidth={0.6}
-                strokeOpacity={0.85}
-              />
-            );
-          })}
-          <text
-            x={padL + innerW / 2}
-            y={feetToY(ARROWS_FEET) - 7}
-            textAnchor="middle"
-            fontSize={8}
-            fill="#64748b"
-          >
-            箭嘴
-          </text>
-        </g>
         {/* board 標籤（頂部左右） */}
         <text x={padL} y={padT - 4} fontSize={9} fill="#94a3b8">
           0
@@ -383,6 +422,37 @@ export default function LaneMap({
             fill="#f97316"
           />
         )}
+        {/* 箭嘴位置：經典 7 箭 @15′（boards 5/10/15/20/25/30/35）— drawn above paths */}
+        <g aria-label="箭嘴 15呎">
+          {ARROW_BOARDS.map((b) => {
+            const x = padL + (b / LANE_W) * innerW;
+            const y = feetToY(ARROWS_FEET);
+            // Larger high-contrast triangles (r5: prior s=3.2 slate was invisible on navy)
+            const s = 5.5;
+            const d = `M${x.toFixed(1)},${(y + s).toFixed(1)} L${(x - s * 0.75).toFixed(1)},${(y - s * 0.55).toFixed(1)} L${(x + s * 0.75).toFixed(1)},${(y - s * 0.55).toFixed(1)} Z`;
+            return (
+              <path
+                key={`arr-${b}`}
+                d={d}
+                fill="#e2e8f0"
+                fillOpacity={1}
+                stroke="#0f172a"
+                strokeWidth={1.1}
+                strokeLinejoin="round"
+              />
+            );
+          })}
+          <text
+            x={padL + innerW / 2}
+            y={feetToY(ARROWS_FEET) - 9}
+            textAnchor="middle"
+            fontSize={9}
+            fontWeight={600}
+            fill="#94a3b8"
+          >
+            箭嘴
+          </text>
+        </g>
         {/* 球瓶：標準 10-pin 三角（board≈3…37 @ ~58–60′），近/擊高亮 */}
         <g aria-label="球瓶 1–10">
           {PIN_DECK.map((pin) => {
@@ -440,7 +510,7 @@ export default function LaneMap({
         </g>
       </svg>
       <p className="mt-2 text-center text-[10px] text-slate-500">
-        箭頭≈15′ · BP≈42′ · 袋口≈60′（路徑僅畫實際追蹤點）
+        箭頭≈15′ · BP≈42′ · 袋口≈60′（路徑僅畫實際追蹤點；短軌外推近瓶）
         {primaryLabel ? ` · ${primaryLabel}` : ""}
       </p>
     </div>

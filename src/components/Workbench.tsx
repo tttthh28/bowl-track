@@ -155,7 +155,10 @@ export default function Workbench() {
   useEffect(() => {
     cornersRef.current = corners;
     // H 用去 skew 映射梯形；畫面四角仍畫真溝（視覺 bar）
-    homoRef.current = corners ? buildTrackHomography(corners) : null;
+    const vw = videoRef.current?.videoWidth;
+    homoRef.current = corners
+      ? buildTrackHomography(corners, vw && vw > 0 ? vw : undefined)
+      : null;
   }, [corners]);
   useEffect(() => {
     settingsRef.current = settings;
@@ -1116,7 +1119,7 @@ export default function Workbench() {
         let trackH = h;
         // 追蹤 ROI／pointInLane 用映射梯形（避免 pin skew 拒球）
         // cornersRef.current 已在外層 if 收窄
-        let trackCorners = mappingCornersForTrack(cornersRef.current);
+        let trackCorners = mappingCornersForTrack(cornersRef.current, w);
         if (scale < 1) {
           let buf = trackBufRef.current;
           if (!buf) {

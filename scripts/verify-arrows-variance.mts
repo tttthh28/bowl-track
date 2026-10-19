@@ -74,7 +74,7 @@ function downscale(
 }
 
 function fullTrack(corners: LaneCorners) {
-  const mapC = mappingCornersForTrack(corners);
+  const mapC = mappingCornersForTrack(corners, W);
   const Hm = buildHomography(mapC)!;
   const { scale, tw, th } = trackWorkSize(W, H);
   const workC = scaleLaneCorners(mapC, scale);

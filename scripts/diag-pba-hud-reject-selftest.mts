@@ -103,7 +103,7 @@ const rows: Row[] = [];
     for (let f = 5; f < 70; f++) frames.push({ rgba: frameAt(raw, W, H, f), width: W, height: H });
     const arr = det ? scoreCornersByProbe(det.corners, frames).arrows : null;
     const mapArr = det
-      ? scoreCornersByProbe(mappingCornersForTrack(det.corners), frames).arrows
+      ? scoreCornersByProbe(det.corners, frames).arrows
       : null;
     const c = det?.corners;
     const gutterOk =

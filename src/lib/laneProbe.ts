@@ -53,7 +53,7 @@ export function scoreCornersByProbe(
   const vw = frames[0].width;
   const vh = frames[0].height;
   // 顯示四角可全溝 skew；追蹤／H 用去 skew 映射梯形（保 arr∈[13,15]）
-  const mapCorners = mappingCornersForTrack(corners);
+  const mapCorners = mappingCornersForTrack(corners, vw);
   const Hm = buildHomography(mapCorners);
   if (!Hm) {
     return {

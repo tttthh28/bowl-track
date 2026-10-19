@@ -16,7 +16,7 @@ import { scoreCornersByProbe } from "../src/lib/laneProbe.ts";
 import { mappingCornersForTrack } from "../src/lib/perspective.ts";
 import type { LaneCorners } from "../src/lib/types.ts";
 
-const OUT = join(import.meta.dirname, "../tmp-reports/corra-demo-tl-2026-10-19");
+const OUT = join(import.meta.dirname, "../tmp-reports/tl-right-overshoot-2026-10-19");
 mkdirSync(OUT, { recursive: true });
 
 function ensureSeq(video: string, out: string, W: number, H: number, fps: number, n: number) {
@@ -57,8 +57,8 @@ function drawOverlay(rgba: Uint8ClampedArray, W: number, H: number, corners: Lan
   };
   // L15 reference: foul + pin-head Y≈0.083
   if (W === 1060) {
-    line(208, H * 0.87, 560, H * 0.096, 0, 255, 80, 2);
-    line(802, H * 0.87, 749, H * 0.096, 255, 60, 60, 2);
+    line(184, H * 0.87, 563, H * 0.096, 0, 255, 80, 2);
+    line(818, H * 0.87, 696, H * 0.096, 255, 60, 60, 2);
     // AMF (~0.063), heads target (~0.096), necks (~0.11)
     line(540, H * 0.063, 720, H * 0.063, 255, 200, 0, 1);
     line(540, H * 0.096, 720, H * 0.096, 80, 255, 80, 1);
@@ -100,7 +100,7 @@ function abovePinFrac(rgba: Uint8ClampedArray, W: number, H: number, pinY: numbe
 }
 
 const rows: any[] = [];
-const L15 = { foulL: 208, foulR: 802, pinsL: 560, pinsR: 749 }; // at pinY≈0.096 (r4 lips)
+const L15 = { foulL: 184, foulR: 818, pinsL: 563, pinsR: 696 }; // Tester green/red @pinY≈0.096 (r6 meas)
 
 // DEMO
 {
@@ -118,7 +118,7 @@ const L15 = { foulL: 208, foulR: 802, pinsL: 560, pinsR: 749 }; // at pinY≈0.0
     const det = detectLaneCorners(rgba, W, H);
     const arr = det ? scoreCornersByProbe(det.corners, probeFrames).arrows : null;
     const mapArr = det
-      ? scoreCornersByProbe(mappingCornersForTrack(det.corners), probeFrames).arrows
+      ? scoreCornersByProbe(det.corners, probeFrames).arrows
       : null;
     const c = det?.corners;
     const foulDxL = c ? c.bl.x - L15.foulL : null;
@@ -135,9 +135,9 @@ const L15 = { foulL: 208, foulR: 802, pinsL: 560, pinsR: 749 }; // at pinY≈0.0
       !!c &&
       Math.abs(foulDxL!) < 25 &&
       Math.abs(foulDxR!) < 25 &&
-      Math.abs(pinsDxL!) < 40 &&
-      Math.abs(pinsDxR!) < 40 &&
-      botFrac! >= 0.5 &&
+      Math.abs(pinsDxL!) < 15 &&
+      Math.abs(pinsDxR!) < 15 &&
+      botFrac! >= 0.52 &&
       botFrac! <= 0.64 &&
       headsOk;
     const png = join(OUT, `demo-run${run}-fi${fi}-pinY${pinY?.toFixed(3) ?? "na"}.png`);

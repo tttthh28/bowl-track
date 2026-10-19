@@ -107,7 +107,7 @@ console.log(
     ? `auto conf=${(det.confidence * 100).toFixed(0)}% botFrac=${(((corners.br.x - corners.bl.x) / W)).toFixed(2)}`
     : "default"
 );
-const mapC = mappingCornersForTrack(corners);
+const mapC = mappingCornersForTrack(corners, W);
 const Hm = buildHomography(mapC)!;
 const settings = { ...DEFAULT_TRACKER, sensitivity: 26, minBlobPixels: 28 };
 

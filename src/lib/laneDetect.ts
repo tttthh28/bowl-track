@@ -1090,10 +1090,11 @@ export function snapCornersToTrueGutter(
   const sw0 = sw ?? Math.max(40, Math.round(width * s));
   const sh0 = sh ?? Math.max(40, Math.round(height * s));
   const inv = 1 / s;
+  // r7: prefer foul band ~0.885–0.90 (was floor 0.86 / prior Hough ≤0.88 → float above foul)
   const foulY = clamp(
-    Math.max(corners.bl.y * s, corners.br.y * s, sh0 * 0.86),
-    sh0 * 0.84,
-    sh0 * 0.92
+    Math.max(corners.bl.y * s, corners.br.y * s, sh0 * 0.885),
+    sh0 * 0.885,
+    sh0 * 0.905
   );
   const pinTarget = clamp(
     ((corners.tl.y + corners.tr.y) / 2) * s,
@@ -1118,35 +1119,41 @@ export function snapCornersToTrueGutter(
     if (outerGood) {
       const midF = (corners.bl.x + corners.br.x) / 2;
       const botW = botW0;
-      let topW = corners.tr.x - corners.tl.x;
-      let midP = (corners.tl.x + corners.tr.x) / 2;
-      const taper = topW / Math.max(1, botW);
-      const skewTarget = midF + width * 0.14;
+      const skewTarget = midF + width * 0.12;
       // Manual / no-image: keep corners unchanged (idempotent keptEqual)
       if (!gray && !rgba) {
         return corners;
       }
-      if (taper < 0.22 || taper > 0.36 || midP < width * 0.50 || midP > width * 0.70) {
-        topW = botW * 0.30;
-        midP = clamp(skewTarget, width * 0.52, width * 0.68);
-      } else {
-        midP = clamp(midP * 0.4 + skewTarget * 0.6, width * 0.52, width * 0.68);
-        topW = clamp(topW, botW * 0.24, botW * 0.34);
-      }
-      // Clamp TL/TR to foul-anchored lips @ pin-head Y (never lane-number masking)
+      // Foul-anchor from BL/BR. r6: drop TL nudge; taper~0.21 / skew~0.12·W.
+      // r7: snap BL/BR Y onto foul band (~0.885–0.90) and extrapolate lip X to that Y
+      // (prior kept inset X from a higher/narrower row → BL ~24px right of green).
+      const topW = botW * 0.21;
+      const midP = clamp(skewTarget, width * 0.52, width * 0.68);
       const py = clamp(Math.max(pinY0, height * 0.094), height * 0.094, height * 0.100);
       const fy = clamp(
-        (corners.bl.y + corners.br.y) / 2,
-        height * 0.82,
-        height * 0.94
+        Math.max((corners.bl.y + corners.br.y) / 2, height * 0.885),
+        height * 0.885,
+        height * 0.900
       );
-      const tlX = midP - topW / 2;
+      const xAtY = (
+        top: { x: number; y: number },
+        bot: { x: number; y: number },
+        y: number
+      ) => {
+        const dy = bot.y - top.y;
+        if (Math.abs(dy) < 1e-3) return bot.x;
+        return top.x + ((bot.x - top.x) * (y - top.y)) / dy;
+      };
+      const blX = xAtY(corners.tl, corners.bl, fy);
+      const brX = xAtY(corners.tr, corners.br, fy);
+      let tlX = midP - topW / 2;
       const trX = midP + topW / 2;
+      if (tlX >= trX - width * 0.08) tlX = trX - width * 0.08;
       return {
         tl: clampPt({ x: tlX, y: py }, width, height),
         tr: clampPt({ x: trX, y: py }, width, height),
-        br: clampPt({ x: corners.br.x, y: fy }, width, height),
-        bl: clampPt({ x: corners.bl.x, y: fy }, width, height),
+        br: clampPt({ x: brX, y: fy }, width, height),
+        bl: clampPt({ x: blX, y: fy }, width, height),
       };
     }
   }
@@ -1176,16 +1183,16 @@ export function snapCornersToTrueGutter(
       let topW = fTR - fTL;
       let midP = (fTL + fTR) / 2;
       const taper = topW / Math.max(1e-3, botW);
-      if (taper < 0.22 || taper > 0.36 || !Number.isFinite(topW)) {
-        topW = botW * 0.30;
-        const skewTarget = midF + sw0 * 0.14;
+      if (taper < 0.18 || taper > 0.32 || !Number.isFinite(topW)) {
+        topW = botW * 0.21;
+        const skewTarget = midF + sw0 * 0.12;
         midP = clamp(skewTarget, sw0 * 0.50, sw0 * 0.68);
         fTL = midP - topW / 2;
         fTR = midP + topW / 2;
       } else {
-        const skewTarget = midF + sw0 * 0.14;
+        const skewTarget = midF + sw0 * 0.12;
         midP = clamp(midP * 0.4 + skewTarget * 0.6, sw0 * 0.50, sw0 * 0.68);
-        topW = clamp(topW, botW * 0.24, botW * 0.34);
+        topW = clamp(topW, botW * 0.18, botW * 0.28);
         fTL = midP - topW / 2;
         fTR = midP + topW / 2;
       }
@@ -1197,9 +1204,13 @@ export function snapCornersToTrueGutter(
         midFrac <= 0.56 &&
         fTL < fTR
       ) {
+        // r6: geometric lips only (no TL-only nudge — r5 +0.02·W overshot)
+        let tlOut = fTL * inv;
+        const trOut = fTR * inv;
+        if (tlOut >= trOut - width * 0.08) tlOut = trOut - width * 0.08;
         return {
-          tl: clampPt({ x: fTL * inv, y: pinTarget * inv }, width, height),
-          tr: clampPt({ x: fTR * inv, y: pinTarget * inv }, width, height),
+          tl: clampPt({ x: tlOut, y: pinTarget * inv }, width, height),
+          tr: clampPt({ x: trOut, y: pinTarget * inv }, width, height),
           br: clampPt({ x: fBR * inv, y: foulY * inv }, width, height),
           bl: clampPt({ x: fBL * inv, y: foulY * inv }, width, height),
         };
