@@ -18,7 +18,7 @@ import {
 } from "../src/lib/tracker.ts";
 import { detectLaneCorners, scoreLaneGeometry } from "../src/lib/laneDetect.ts";
 import { pickBestCornersByProbe } from "../src/lib/laneProbe.ts";
-import { defaultCorners, imageToLane, buildHomography } from "../src/lib/perspective.ts";
+import { defaultCorners, imageToLane, buildHomography, mappingCornersForTrack } from "../src/lib/perspective.ts";
 import { computeShotEstimate } from "../src/lib/estimates.ts";
 import {
   evaluateShotQuality,
@@ -61,7 +61,7 @@ const ranked = detCands
     const midBot = (corners.bl.x + corners.br.x) / 2;
     const midFrac = Math.abs(midBot / W - 0.5);
     const widthOk =
-      botFrac >= 0.5 && botFrac <= 0.54
+      botFrac >= 0.5 && botFrac <= 0.56
         ? 28
         : botFrac >= 0.46 && botFrac < 0.5
           ? 12
@@ -107,7 +107,8 @@ console.log(
     ? `auto conf=${(det.confidence * 100).toFixed(0)}% botFrac=${(((corners.br.x - corners.bl.x) / W)).toFixed(2)}`
     : "default"
 );
-const Hm = buildHomography(corners)!;
+const mapC = mappingCornersForTrack(corners);
+const Hm = buildHomography(mapC)!;
 const settings = { ...DEFAULT_TRACKER, sensitivity: 26, minBlobPixels: 28 };
 
 const LOOPS = 6;
@@ -162,14 +163,14 @@ for (let loop = 0; loop < LOOPS; loop++) {
   };
 
   const { scale, tw, th } = trackWorkSize(W, H);
-  const workCorners = scaleLaneCorners(corners, scale);
+  const workCorners = scaleLaneCorners(mapC, scale);
   for (let f = 0; f < frames; f++) {
     const offset = f * frameBytes;
     const rgba = new Uint8ClampedArray(raw.buffer, raw.byteOffset + offset, frameBytes);
     // nearest downscale if needed
     let workRgba: Uint8ClampedArray;
     let ww = W, wh = H;
-    let useCorners = corners;
+    let useCorners = mapC;
     if (scale < 1) {
       workRgba = new Uint8ClampedArray(tw * th * 4);
       for (let y = 0; y < th; y++) {

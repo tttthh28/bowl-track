@@ -11,7 +11,7 @@ import {
   trackWorkSize,
   scaleLaneCorners,
 } from "./tracker";
-import { buildHomography, imageToLane } from "./perspective";
+import { buildHomography, imageToLane, mappingCornersForTrack } from "./perspective";
 import { computeShotEstimate } from "./estimates";
 import type { LaneDetectResult } from "./laneDetect";
 import type { LaneCorners } from "./types";
@@ -52,7 +52,9 @@ export function scoreCornersByProbe(
   }
   const vw = frames[0].width;
   const vh = frames[0].height;
-  const Hm = buildHomography(corners);
+  // 顯示四角可全溝 skew；追蹤／H 用去 skew 映射梯形（保 arr∈[13,15]）
+  const mapCorners = mappingCornersForTrack(corners);
+  const Hm = buildHomography(mapCorners);
   if (!Hm) {
     return {
       score: geomRank - 100,
@@ -65,7 +67,7 @@ export function scoreCornersByProbe(
     };
   }
   const { scale, tw, th } = trackWorkSize(vw, vh);
-  const workCorners = scaleLaneCorners(corners, scale);
+  const workCorners = scaleLaneCorners(mapCorners, scale);
   const st = new BallTrackerState();
   const settings = { ...DEFAULT_TRACKER, sensitivity: 26, minBlobPixels: 28 };
   const boards: number[] = [];
@@ -85,7 +87,7 @@ export function scoreCornersByProbe(
     let trackRgba = fr.rgba;
     let trackW = fr.width;
     let trackH = fr.height;
-    let useC = corners;
+    let useC = mapCorners;
     if (scale < 1) {
       trackRgba = downscaleNearest(fr.rgba, fr.width, fr.height, tw, th);
       trackW = tw;
@@ -156,30 +158,29 @@ export function scoreCornersByProbe(
           : -55;
   const earlyOk =
     minFeet <= 18 ? 28 : minFeet <= 22 ? 10 : minFeet <= 28 ? -30 : -50;
-  // 貼真溝 0.50–0.54 加分（診斷可保 arr 13–15）；>0.55／<0.36 罰
+  // 真溝 foul≈0.50–0.58 加分；過窄（亮帶內縮）罰
   const widePen =
-    botFrac > 0.55
+    botFrac > 0.62
       ? -30
-      : botFrac >= 0.50 && botFrac <= 0.54
+      : botFrac >= 0.50 && botFrac <= 0.58
         ? 22
         : botFrac >= 0.46 && botFrac < 0.50
-          ? 12
+          ? 10
           : botFrac >= 0.40 && botFrac < 0.46
-            ? 4
+            ? -8
             : botFrac < 0.36
-              ? -12
+              ? -16
               : 0;
   const midStickPen =
     med != null && Math.abs(med - 19.5) < 2.2 && coverSpan < 8
       ? -20
       : 0;
-  // 四角中線偏右半 → 易鄰道
   const midBot = (corners.bl.x + corners.br.x) / 2;
-  const midRightPen = midBot / Math.max(1, vw) > 0.52 ? -22 : midBot / Math.max(1, vw) > 0.5 ? -10 : 0;
-  // bowling-demo 好角 mid≈0.42–0.45；正中偏右易鄰道
+  const midRightPen = midBot / Math.max(1, vw) > 0.54 ? -18 : midBot / Math.max(1, vw) > 0.52 ? -8 : 0;
+  // 真溝 midF≈0.47–0.50
   const midFrac = midBot / Math.max(1, vw);
   const midLaneBonus =
-    midFrac >= 0.40 && midFrac <= 0.46 ? 18 : midFrac >= 0.38 && midFrac < 0.50 ? 6 : 0;
+    midFrac >= 0.46 && midFrac <= 0.50 ? 18 : midFrac >= 0.44 && midFrac < 0.52 ? 8 : 0;
   let gutterRace = false;
   let gutterRacePen = 0;
   if (earlyBoards.length >= 3) {
@@ -301,7 +302,7 @@ export function pickBestCornersByProbe(
           a >= 12.5 &&
           a <= 15.5 &&
           botF >= 0.5 &&
-          botF <= 0.54 &&
+          botF <= 0.56 &&
           detail.med >= 7 &&
           detail.med <= 37));
     // 主帶 12.5–15.5（Tony）；次帶 8–18；拒 ~21／~28.5
@@ -313,7 +314,7 @@ export function pickBestCornersByProbe(
       medOkPick &&
       // 闊底貼溝時早段 board 易散（gutterRace）；有 Tony arr 仍收
       (!detail.gutterRace ||
-        (a >= 12.5 && a <= 15.5 && botF >= 0.5 && botF <= 0.54)) &&
+        (a >= 12.5 && a <= 15.5 && botF >= 0.5 && botF <= 0.56)) &&
       detail.minFeet <= 18 &&
       detail.maxFeet - detail.minFeet >= 12
     ) {
@@ -326,7 +327,7 @@ export function pickBestCornersByProbe(
       else if (a >= 11 && a <= 16.5) bandBonus += 15;
       if (midB >= 0.415 && midB <= 0.445) bandBonus += 30;
       else if (midB >= 0.40 && midB <= 0.46) bandBonus += 10;
-      if (botF >= 0.5 && botF <= 0.54) bandBonus += 25;
+      if (botF >= 0.5 && botF <= 0.56) bandBonus += 25;
       const adj = { ...detail, score: detail.score + bandBonus };
       if (
         !bestWithArrows ||

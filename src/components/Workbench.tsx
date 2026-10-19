@@ -10,15 +10,21 @@ import LaneMap from "./LaneMap";
 import ShotStats from "./ShotStats";
 import {
   buildHomography,
+  buildTrackHomography,
   defaultCorners,
   imageToLane,
+  mappingCornersForTrack,
+  smoothDemoPath,
   type Homography,
 } from "@/lib/perspective";
 import { computeShotEstimate } from "@/lib/estimates";
+import { rebuildPlaneConstrainedPath } from "@/lib/trajectory3d";
 import {
   detectLaneFromCanvas,
   fallbackDefaultCorners,
   frameHasLaneSignal,
+  isNarrowMidLaneWedge,
+  looksLikeBroadcastLane,
   scoreLaneGeometry,
   snapCornersToTrueGutter,
   voteFoulYAcrossFrames,
@@ -97,6 +103,8 @@ export default function Workbench() {
   const pbaSawHighBoardRef = useRef(false);
   /** bowling-demo：inset 搜球避開溝邊；中段鎖穩後切回全角追 pocket */
   const demoInsetActiveRef = useRef(true);
+  /** bowling-demo：中段 lost 前進 softRelock 只用一次／投 */
+  const midRecoverUsedRef = useRef(0);
   const finishingRef = useRef(false);
   /** 存檔後冷卻，避免短投連存 */
   const shotCooldownUntilRef = useRef(0);
@@ -146,7 +154,8 @@ export default function Workbench() {
 
   useEffect(() => {
     cornersRef.current = corners;
-    homoRef.current = corners ? buildHomography(corners) : null;
+    // H 用去 skew 映射梯形；畫面四角仍畫真溝（視覺 bar）
+    homoRef.current = corners ? buildTrackHomography(corners) : null;
   }, [corners]);
   useEffect(() => {
     settingsRef.current = settings;
@@ -377,34 +386,137 @@ export default function Workbench() {
         const botFrac = botW / vw;
         const midBot = (corners.bl.x + corners.br.x) / 2;
         const midFrac = Math.abs(midBot / vw - 0.5);
-        const widthOk =
-          botFrac >= 0.5 && botFrac <= 0.54
+        const isBcast =
+          !!c.det.broadcastHud || looksLikeBroadcastLane(corners, vw);
+        // 廣播真溝 bot≈0.20–0.30 mid≈0.32–0.42；薄楔（<0.17）／過左 mid 重罰
+        // demo 真溝≈0.50–0.58
+        const widthOk = isBcast
+          ? botFrac >= 0.18 && botFrac <= 0.32
+            ? 42
+            : botFrac >= 0.16 && botFrac <= 0.36
+              ? 24
+              : botFrac >= 0.14 && botFrac <= 0.4
+                ? 8
+                : -28
+          : botFrac >= 0.5 && botFrac <= 0.58
             ? 36
             : botFrac >= 0.46 && botFrac < 0.5
-              ? 28
-              : botFrac >= 0.32 && botFrac <= 0.48
-                ? 20
-                : botFrac >= 0.28 && botFrac <= 0.55
-                  ? 6
+              ? 24
+              : botFrac >= 0.4 && botFrac <= 0.62
+                ? 10
+                : botFrac >= 0.32 && botFrac <= 0.65
+                  ? 2
                   : -35;
-        // 本 demo／後方視角單道常略偏左；mid 貼右半易鎖鄰道
-        const midRightPen =
-          midBot / vw > 0.52 ? -18 : midBot / vw > 0.5 ? -8 : 0;
-        const midOk =
-          (midFrac < 0.1 ? 22 : midFrac < 0.16 ? 6 : -30) + midRightPen;
-        return { ...c, rank: c.geom + widthOk + midOk };
+        // 真溝 mid≈0.47；廣播 mid≈0.32–0.42；右偏（吸 HUD）／過左薄楔重罰
+        const midRightPen = isBcast
+          ? midBot / vw > 0.52
+            ? -40
+            : midBot / vw > 0.48
+              ? -18
+              : midBot / vw < 0.28
+                ? -30
+                : midBot / vw < 0.3
+                  ? -12
+                  : 0
+          : midBot / vw > 0.54
+            ? -18
+            : midBot / vw > 0.52
+              ? -8
+              : 0;
+        const midOk = isBcast
+          ? midBot / vw >= 0.28 && midBot / vw <= 0.46
+            ? 28
+            : midBot / vw >= 0.24 && midBot / vw <= 0.5
+              ? 12
+              : -28
+          : (midFrac < 0.08 ? 22 : midFrac < 0.14 ? 10 : midFrac < 0.2 ? 0 : -30) +
+            midRightPen;
+        const bcastBonus = isBcast ? 30 : 0;
+        const thinWedgePen = isBcast && botFrac < 0.17 ? -40 : 0;
+        const hudEdgePen =
+          corners.br.x / vw > 0.72 || corners.tr.x / vw > 0.78 ? -50 : 0;
+        const pinYf =
+          (corners.tl.y + corners.tr.y) / 2 / Math.max(1, v.videoHeight || 1);
+        const foulYf =
+          (corners.bl.y + corners.br.y) / 2 / Math.max(1, v.videoHeight || 1);
+        const extentF = foulYf - pinYf;
+        const taperF =
+          (corners.tr.x - corners.tl.x) / Math.max(1, botW);
+        const midWedge = isNarrowMidLaneWedge(
+          corners,
+          vw,
+          Math.max(1, v.videoHeight || 1)
+        );
+        const maskPen =
+          midWedge
+            ? -120
+            : isBcast && extentF < 0.36 && taperF > 0.65 && botFrac < 0.34
+              ? -90
+              : isBcast && extentF < 0.4 && botFrac < 0.28 && taperF > 0.75
+                ? -55
+                : 0;
+        return {
+          ...c,
+          rank:
+            c.geom +
+            widthOk +
+            midOk +
+            bcastBonus +
+            hudEdgePen +
+            midRightPen +
+            thinWedgePen +
+            maskPen,
+        };
       });
       ranked.sort((a, b) => b.rank - a.rank);
-      if (ranked.length >= 1) {
-        result = {
-          ...ranked[0].det,
-          corners: snapCornersToTrueGutter(
-            ranked[0].det.corners,
-            v.videoWidth,
-            v.videoHeight
-          ),
-        };
-        bestScore = ranked[0].rank;
+      const usable = ranked.filter(
+        (r) =>
+          r.rank > -40 &&
+          !isNarrowMidLaneWedge(
+            r.det.corners,
+            vw,
+            Math.max(1, v.videoHeight || 1)
+          )
+      );
+      if (usable.length >= 1) {
+        const top = usable[0].det;
+        const vh = Math.max(1, v.videoHeight || 1);
+        const pinYs = (top.corners.tl.y + top.corners.tr.y) / 2 / vh;
+        const foulYs = (top.corners.bl.y + top.corners.br.y) / 2 / vh;
+        const ext = foulYs - pinYs;
+        const bW = top.corners.br.x - top.corners.bl.x;
+        const tW = top.corners.tr.x - top.corners.tl.x;
+        const tap = tW / Math.max(1, bW);
+        const bF = bW / vw;
+        const looksMask =
+          isNarrowMidLaneWedge(top.corners, vw, vh) ||
+          ((!!top.broadcastHud || looksLikeBroadcastLane(top.corners, vw)) &&
+            ext < 0.36 &&
+            tap > 0.65 &&
+            bF < 0.34);
+        // Prefer fail→manual over locking mid-wedge (CLEAR stale result)
+        if (!looksMask) {
+          const snapped =
+            top.broadcastHud || looksLikeBroadcastLane(top.corners, vw)
+              ? top.corners
+              : snapCornersToTrueGutter(
+                  top.corners,
+                  v.videoWidth,
+                  v.videoHeight
+                );
+          result = {
+            ...top,
+            corners: snapped,
+          };
+          bestScore = usable[0].rank;
+        } else {
+          result = null;
+          bestScore = -1e9;
+        }
+      } else if (ranked.length >= 1) {
+        // All candidates mid-wedge / low rank → fail-open
+        result = null;
+        bestScore = -1e9;
       }
 
       // 上傳片：先抓連續幀 buffer（~15fps），再用共用探針揀角
@@ -440,16 +552,36 @@ export default function Workbench() {
             10
           );
           if (picked) {
-            // 再 snap：保證 mid／bot 唔受候選 foulY 差影響
+            // 再 snap：demo 鎖真溝；廣播片保留探針／擬合（避 HUD）
+            const pc = picked.det.corners;
+            const vhP = Math.max(1, v.videoHeight || 1);
+            const extP =
+              (pc.bl.y + pc.br.y) / 2 / vhP - (pc.tl.y + pc.tr.y) / 2 / vhP;
+            const bFp = (pc.br.x - pc.bl.x) / v.videoWidth;
+            const tapP =
+              (pc.tr.x - pc.tl.x) / Math.max(1, pc.br.x - pc.bl.x);
+            const maskP =
+              isNarrowMidLaneWedge(pc, v.videoWidth, vhP) ||
+              (!!picked.det.broadcastHud &&
+                extP < 0.36 &&
+                tapP > 0.65 &&
+                bFp < 0.34);
+            if (!maskP) {
+            const keepBcast =
+              picked.det.broadcastHud ||
+              looksLikeBroadcastLane(pc, v.videoWidth);
             result = {
               ...picked.det,
-              corners: snapCornersToTrueGutter(
-                picked.det.corners,
-                v.videoWidth,
-                v.videoHeight
-              ),
+              corners: keepBcast
+                ? pc
+                : snapCornersToTrueGutter(pc, v.videoWidth, v.videoHeight),
             };
             bestScore = picked.detail.score;
+            } else {
+              // Mid-wedge from probe → fail-open (do not keep prior auto lock)
+              result = null;
+              bestScore = -1e9;
+            }
             const pa = picked.detail.arrows;
             const tonyBand =
               pa != null && pa >= 12.5 && pa <= 15.5;
@@ -506,7 +638,18 @@ export default function Workbench() {
         }
       }
 
-      // 幾何太差先當失敗（唔好用假梯形當成功）
+      // 幾何太差／mid-wedge 先當失敗（唔好用假梯形當成功）
+      if (
+        result &&
+        isNarrowMidLaneWedge(
+          result.corners,
+          v.videoWidth || 1,
+          v.videoHeight || 1
+        )
+      ) {
+        result = null;
+        bestScore = -1e9;
+      }
       const accept =
         result &&
         (bestScore >= 55 || result.confidence >= 0.45);
@@ -680,10 +823,17 @@ export default function Workbench() {
       return;
     }
 
-    const q = evaluateShotQuality(points);
+    // bowling-demo：存檔前平滑尖角（UI 圖同估計一致；PBA 唔動）
+    const pbaEarly = !!settingsRef.current.boardFromRight;
+    const pointsForSave =
+      sourceModeRef.current === "upload" && !pbaEarly
+        ? smoothDemoPath(points)
+        : points;
+
+    const q = evaluateShotQuality(pointsForSave);
     if (!q.ok) {
       discard(
-        points.length === 0
+        pointsForSave.length === 0
           ? "等待球出現…"
           : `軌跡不足已忽略（${q.reason}／${q.feetSpan.toFixed(1)}′／${(
               q.durationMs / 1000
@@ -692,10 +842,28 @@ export default function Workbench() {
       return;
     }
 
+    // bowling-demo：拒中段短碎（TesterManual r6: densify 後仍存 18–35′）
+    // 要 foul→pins 先存，Arr 先有 ~15′ 樣本可對 path。
+    if (sourceModeRef.current === "upload" && !pbaEarly) {
+      const rawFeet = pointsForSave
+        .filter((pt) => pt.lane && !pt.predicted)
+        .map((pt) => pt.lane!.feet);
+      if (rawFeet.length >= 2) {
+        const minF = Math.min(...rawFeet);
+        const maxF = Math.max(...rawFeet);
+        if (minF > 10 || maxF < 48) {
+          discard(
+            `覆蓋不足已忽略（${minF.toFixed(0)}–${maxF.toFixed(0)}′，需 foul→pins）`
+          );
+          return;
+        }
+      }
+    }
+
     const last = lastSavedShotRef.current;
     if (
       isDuplicateOfLastShot(
-        points,
+        pointsForSave,
         last?.points,
         last?.createdAt,
         Date.now()
@@ -707,16 +875,32 @@ export default function Workbench() {
 
     const rpm = getRpmEstimate(trackerRef.current);
     const pbaMode = !!settingsRef.current.boardFromRight;
-    // bowling-demo only：剔爬溝頭；PBA 手動路徑唔修剪（否則 Arrows／BP —）
-    let estPoints = points;
+    // bowling-demo only：剔 foul 區溝爬頭；保留 12–25′（舊 ≥25′ 門檻會令覆蓋變 27–39′）
+    // PBA 手動路徑唔修剪（否則 Arrows／BP —）
+    let estPoints = pointsForSave;
     if (sourceModeRef.current === "upload" && !pbaMode) {
-      const trimmed = points.filter(
+      const trimmed = pointsForSave.filter(
         (p) =>
           !p.lane ||
-          p.lane.feet >= 25 ||
-          (p.lane.board > 8 && p.lane.board <= 18)
+          p.lane.feet >= 12 ||
+          (p.lane.board > 5.5 && p.lane.board < 22)
       );
       if (trimmed.filter((p) => p.lane).length >= 8) estPoints = trimmed;
+    }
+    // Alinejad-port: plane-constrained rebuild from image + H (manual corners)
+    // bowling-demo: skip rebuild — densify knots have synthetic image coords;
+    // reprojecting them shifts boards away from LaneMap (TesterManual r5 Arr≠path).
+    // Estimate must use the same pointsForSave path the map draws.
+    const Hfinish = homoRef.current;
+    if (pbaMode && Hfinish && estPoints.length >= 4) {
+      const rebuilt = rebuildPlaneConstrainedPath(estPoints, Hfinish, {
+        reproject: true,
+        maxBoardJump: 8,
+        maxFeetBack: 2.5,
+      });
+      if (rebuilt.points.filter((pt) => pt.lane).length >= 6) {
+        estPoints = rebuilt.points;
+      }
     }
     const estimate = computeShotEstimate(estPoints, rpm, {
       boardFromRight: pbaMode,
@@ -743,12 +927,12 @@ export default function Workbench() {
     const shot: Shot = {
       id: `shot_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
       createdAt: Date.now(),
-      points,
+      points: pointsForSave,
       estimate,
       source: sourceModeRef.current === "upload" ? "upload" : "camera",
     };
     // 先鎖本圈／冷卻，再 append——避免 RAF 同幀連存 6 投
-    lastSavedShotRef.current = { points, createdAt: shot.createdAt };
+    lastSavedShotRef.current = { points: pointsForSave, createdAt: shot.createdAt };
     shotCooldownUntilRef.current = now + 2800;
     if (sourceModeRef.current === "upload") {
       loopCycleSavedRef.current = true;
@@ -756,14 +940,14 @@ export default function Workbench() {
     }
     setLiveEstimate(estimate);
     {
-      const oriented = points
+      const oriented = pointsForSave
         .filter((p) => p.lane && !p.predicted)
         .slice(0, 40)
         .map((p) => `${p.lane!.feet.toFixed(1)}L${p.lane!.board.toFixed(1)}`)
         .join("|");
       lastDebugShotRef.current = {
         estimate,
-        n: points.length,
+        n: pointsForSave.length,
         boardsSample: oriented,
         pba: pbaMode,
       };
@@ -772,7 +956,7 @@ export default function Workbench() {
           lastDebugShotRef.current;
       }
     }
-    setLivePath(points.filter((p) => p.lane).map((p) => p.lane!));
+    setLivePath(pointsForSave.filter((p) => p.lane).map((p) => p.lane!));
     // appendShot 唔可以放 setState updater（Strict Mode 會跑兩次 → 成對重複）
     const sid = sessionRef.current?.id;
     if (sid) {
@@ -875,8 +1059,15 @@ export default function Workbench() {
             const feet = pts.filter((p) => p.lane).map((p) => p.lane!.feet);
             const span =
               feet.length >= 2 ? Math.max(...feet) - Math.min(...feet) : 0;
-            // 短碎軌（入溝）唔存；等下一圈完整 foul→pocket
-            if (span >= 12 && evaluateShotQuality(pts).ok) {
+            // 短碎軌／中段碎（r6 18–35′）唔存；等完整 foul→pins
+            const minL = feet.length ? Math.min(...feet) : 99;
+            const maxL = feet.length ? Math.max(...feet) : 0;
+            if (
+              span >= 35 &&
+              minL <= 10 &&
+              maxL >= 48 &&
+              evaluateShotQuality(pts).ok
+            ) {
               finishingRef.current = true;
               finishShot();
             } else {
@@ -896,6 +1087,7 @@ export default function Workbench() {
           gutterRejectStreakRef.current = 0;
           pbaSawHighBoardRef.current = false;
           demoInsetActiveRef.current = true;
+          midRecoverUsedRef.current = 0;
           drawOverlay();
           return;
         }
@@ -922,7 +1114,9 @@ export default function Workbench() {
         let trackRgba: Uint8ClampedArray;
         let trackW = w;
         let trackH = h;
-        let trackCorners = cornersRef.current;
+        // 追蹤 ROI／pointInLane 用映射梯形（避免 pin skew 拒球）
+        // cornersRef.current 已在外層 if 收窄
+        let trackCorners = mappingCornersForTrack(cornersRef.current);
         if (scale < 1) {
           let buf = trackBufRef.current;
           if (!buf) {
@@ -943,15 +1137,30 @@ export default function Workbench() {
           trackRgba = small.data;
           trackW = tw;
           trackH = th;
-          trackCorners = scaleLaneCorners(cornersRef.current, scale);
+          trackCorners = scaleLaneCorners(trackCorners, scale);
         } else {
           const frame = ctx.getImageData(0, 0, w, h);
           trackRgba = frame.data;
         }
-        // bowling-demo upload：inset 避溝；fastRelock 期間全角以便 12–18′ 抓真球
+        // bowling-demo upload：inset 避溝；fastRelock 全角；中段鎖穩後切回全角追 pocket
         {
           const pbaMode = !!settingsRef.current.boardFromRight;
           const fast = trackerRef.current.fastRelockFrames > 0;
+          if (sourceModeRef.current === "upload" && !pbaMode) {
+            const feet = livePointsRef.current
+              .filter((p) => p.lane)
+              .map((p) => p.lane!.feet);
+            // 舊 ≥24′ 太晚：預測未到 24′ 時 inset 一直開 → UI 死喺 ~10–27′
+            // 有中段樣本或 max≥16′ 即切全角追 pocket
+            if (
+              (feet.length >= 3 && Math.max(...feet) >= 16) ||
+              (feet.length >= 5 &&
+                Math.max(...feet) >= 20 &&
+                feet.some((f) => f >= 12 && f <= 30))
+            ) {
+              demoInsetActiveRef.current = false;
+            }
+          }
           if (
             sourceModeRef.current === "upload" &&
             !pbaMode &&
@@ -1022,8 +1231,8 @@ export default function Workbench() {
             const H = homoRef.current;
             let contact = ballContactPoint(pos, radiusFull);
             let lane = H ? imageToLane(H, contact) : undefined;
-            // demo densify：fastRelock 期間預測點若喺 12–18′，X 吸到 board~14 軌
-            // （避免 ema 左/右漂令 apex board 10 或 16.5，Arr 要靠 clamp）
+            // demo densify：fastRelock 預測點喺 12–18′ 時，僅當已近 tony 帶先輕拉
+            // （0.28）；遠距硬拉會喺 8–12′ 造 V。唔再硬 snap 14.3。
             {
               const pbaMode = !!settingsRef.current.boardFromRight;
               const fast = trackerRef.current.fastRelockFrames > 0;
@@ -1037,20 +1246,23 @@ export default function Workbench() {
                 full &&
                 H &&
                 lane.feet >= 12 &&
-                lane.feet <= 18
+                lane.feet <= 18 &&
+                lane.board >= 10 &&
+                lane.board <= 19
               ) {
                 const foulY = (full.bl.y + full.br.y) / 2;
                 const pinY = (full.tl.y + full.tr.y) / 2;
-                const t =
+                const tt =
                   Math.abs(foulY - pinY) > 1
                     ? Math.max(
                         0,
                         Math.min(1, (foulY - contact.y) / (foulY - pinY))
                       )
                     : 0.25;
-                const leftX = full.bl.x + (full.tl.x - full.bl.x) * t;
-                const rightX = full.br.x + (full.tr.x - full.br.x) * t;
-                const tx = leftX + (rightX - leftX) * (14.3 / 39);
+                const leftX = full.bl.x + (full.tl.x - full.bl.x) * tt;
+                const rightX = full.br.x + (full.tr.x - full.br.x) * tt;
+                const targetX = leftX + (rightX - leftX) * (14.3 / 39);
+                const tx = contact.x * 0.72 + targetX * 0.28;
                 contact = { x: tx, y: contact.y };
                 lane = imageToLane(H, contact) ?? lane;
               }
@@ -1101,30 +1313,86 @@ export default function Workbench() {
                     }
                   }
                 }
-              } else if (sourceModeRef.current === "upload" && !seeded) {
-                // bowling-demo：拒爬溝／晚段高 board；@≥24 softRelock（保留 bg）
-                if (lane.feet < 52 && (lane.board >= 25.5 || lane.board <= 5)) {
+              } else if (sourceModeRef.current === "upload" && !pbaMode) {
+                // bowling-demo（含點球鎖定）：極端溝仍拒；手動四角真球可從左規 board~5–7 出發
+                // 舊只 !seeded → TesterManual 點球後跳過 softRelock／nudge，中段易死
+                if (lane.feet < 52 && (lane.board >= 30 || lane.board <= 2.8)) {
                   accept = false;
                 }
-                if (lane.feet < 22 && (lane.board >= 22 || lane.board <= 7)) {
+                if (lane.feet < 16 && lane.board >= 22) {
                   accept = false;
                 }
-                if (lane.feet < 40 && (lane.board >= 24 || lane.board <= 5)) {
+                // 中後段右漂入溝（seeded 假軌 board→31）
+                if (lane.feet >= 16 && lane.feet < 55 && lane.board >= 27) {
+                  accept = false;
+                }
+                // 早期左溝假鎖 → softRelock；中段靠左 board5–8 可能係真球，只 nudge
+                // softRelock 只喺未建立中段前用（避免抹掉 foul→中段）
+                const leftGutterish =
+                  lane.feet < 16 && lane.board <= 5.5;
+                const rightCrawl =
+                  lane.feet < 24 && lane.board >= 30;
+                const midLeftDrift =
+                  lane.feet >= 16 &&
+                  lane.feet < 45 &&
+                  lane.board <= 5.0;
+                const lanePts = livePointsRef.current.filter((p) => p.lane);
+                const maxLive = lanePts.reduce(
+                  (m, p) => Math.max(m, p.lane!.feet),
+                  0
+                );
+                const established =
+                  maxLive >= 18 &&
+                  lanePts.some(
+                    (p) =>
+                      p.lane!.feet >= 10 &&
+                      p.lane!.board > 8 &&
+                      p.lane!.board < 22
+                  );
+                const stuckLow =
+                  !established &&
+                  lane.feet < 12 &&
+                  lane.board <= 8 &&
+                  lanePts.length >= 4 &&
+                  lanePts.every((p) => p.lane!.feet < 12);
+                if (leftGutterish || rightCrawl) {
+                  accept = false;
+                }
+                // 中段左漂：拒極端 ≤3.5 溝點，5.0 以下仍 nudge 但 ≥3.5 可入軌
+                if (midLeftDrift && lane.board <= 3.5) {
+                  accept = false;
+                }
+                if (
+                  !established &&
+                  (leftGutterish || rightCrawl || stuckLow)
+                ) {
                   gutterRejectStreakRef.current += 1;
-                  if (gutterRejectStreakRef.current >= 1) {
+                  const need = stuckLow || leftGutterish ? 1 : 2;
+                  if (gutterRejectStreakRef.current >= need) {
                     const sc = trackScaleRef.current;
                     const full = cornersRef.current;
                     if (full) {
-                      trackerRef.current.softRelockMid(
-                        sc < 1 ? scaleLaneCorners(full, sc) : full
+                      const work =
+                        sc < 1 ? scaleLaneCorners(full, sc) : full;
+                      trackerRef.current.softRelockMid(work);
+                      livePointsRef.current = livePointsRef.current.filter(
+                        (p) => !p.lane || p.lane.feet <= 14
                       );
                     } else {
                       trackerRef.current.beginNewShot({ clearBg: true });
                     }
                     gutterRejectStreakRef.current = 0;
-                    demoInsetActiveRef.current = true;
                   }
-                } else if (lane.board > 7 && lane.board < 24) {
+                } else if (established && (midLeftDrift || rightCrawl)) {
+                  const sc = trackScaleRef.current;
+                  const full = cornersRef.current;
+                  if (full) {
+                    trackerRef.current.nudgeMidKeepLock(
+                      sc < 1 ? scaleLaneCorners(full, sc) : full
+                    );
+                  }
+                  gutterRejectStreakRef.current = 0;
+                } else if (lane.board > 6 && lane.board < 28) {
                   gutterRejectStreakRef.current = 0;
                 }
               } else {
@@ -1147,40 +1415,101 @@ export default function Workbench() {
                 if (dFeet < -8.0) accept = false;
                 if (dBoard > 28) accept = false;
               } else {
-                if (dFeet < -0.8 || (dBoard > 3.5 && dFeet < 1.0)) accept = false;
-                if (Math.abs(dFeet) / dtPt > 90 || dBoard > 14) accept = false;
+                const fast =
+                  sourceModeRef.current === "upload" &&
+                  trackerRef.current.fastRelockFrames > 0;
+                // softRelock 海岸：容許短暫 feet 回／橫跳；否則 apex 段全被 jump 拒
+                const backLim = fast ? -3.5 : -0.8;
+                const boardJumpLim = fast ? 6.5 : 3.5;
+                if (dFeet < backLim || (dBoard > boardJumpLim && dFeet < 1.0))
+                  accept = false;
+                // 中後段補點常一次跳 8–12′；90 ft/s 太緊 → 覆蓋死喺 ~40′
+                const speedCap =
+                  sourceModeRef.current === "upload" && lane.feet >= 20
+                    ? 150
+                    : 90;
+                if (Math.abs(dFeet) / dtPt > speedCap || dBoard > 14)
+                  accept = false;
+                // climb：只擋急衝右溝；pocket hook board 22–28 要放行
                 if (
                   sourceModeRef.current === "upload" &&
-                  lane.board > 22 &&
+                  lane.board > 28 &&
                   dFeet > 0.35 &&
-                  dBoard / dFeet > 1.5
+                  dBoard / dFeet > 1.8
                 ) {
                   accept = false;
+                }
+                // 拒尖角：fastRelock 期間放行（否則海岸重鎖被誤殺、覆蓋死早段）
+                // 非 fast：早段預測仍擋極端 V；中段擋折角。最終靠 smoothDemoPath 清殘峰。
+                if (
+                  accept &&
+                  sourceModeRef.current === "upload" &&
+                  !pbaMode &&
+                  !fast &&
+                  livePointsRef.current.length >= 2 &&
+                  dFeet > 0.2
+                ) {
+                  const p2 =
+                    livePointsRef.current[livePointsRef.current.length - 2];
+                  if (p2?.lane) {
+                    const dB1 = prev.lane.board - p2.lane.board;
+                    const dF1 = Math.max(
+                      0.15,
+                      prev.lane.feet - p2.lane.feet
+                    );
+                    const slope1 = dB1 / dF1;
+                    const slope2 =
+                      (lane.board - prev.lane.board) / dFeet;
+                    const turn = Math.abs(slope2 - slope1);
+                    const early = prev.lane.feet < 18;
+                    const pred = !!result.predicted;
+                    if (early && pred && turn > 2.4) accept = false;
+                    else if (early && turn > 3.2) accept = false;
+                    else if (!early && turn > 2.2) accept = false;
+                    else if (turn > 3.5) accept = false;
+                  }
                 }
               }
             }
             if (accept) {
-              // 跨過 14–16′ 大跳：插入 predicted 海岸點（真偵測疏時補 apex）
+              // 疏點補插：14–16′ 大跳 + 8–22′ 任意 >2.8′ 空隙（防 13–15′ elbow）
               if (prev?.lane && lane && !result.predicted) {
                 const dF = lane.feet - prev.lane.feet;
-                if (
+                const inTonySpan =
+                  prev.lane.feet < 22 &&
+                  lane.feet > 8 &&
+                  prev.lane.board > 8 &&
+                  prev.lane.board < 23 &&
+                  lane.board > 8 &&
+                  lane.board < 23;
+                const crossArrows =
                   dF > 3.5 &&
                   prev.lane.feet < 15.5 &&
                   lane.feet > 14.5 &&
                   prev.lane.board > 9 &&
                   prev.lane.board < 22 &&
                   lane.board > 9 &&
-                  lane.board < 22
-                ) {
-                  for (const tf of [14, 15, 16]) {
-                    if (tf <= prev.lane.feet + 0.4 || tf >= lane.feet - 0.4)
+                  lane.board < 22;
+                const sparseTony = inTonySpan && dF > 2.8;
+                if (crossArrows || sparseTony) {
+                  const targets: number[] = [];
+                  if (crossArrows) {
+                    for (const tf of [13, 14, 15, 16]) targets.push(tf);
+                  } else {
+                    // 每隔 ~1.4′ 插一點
+                    const n = Math.min(4, Math.max(1, Math.floor(dF / 1.4)));
+                    for (let k = 1; k <= n; k++) {
+                      targets.push(prev.lane.feet + (dF * k) / (n + 1));
+                    }
+                  }
+                  for (const tf of targets) {
+                    if (tf <= prev.lane.feet + 0.35 || tf >= lane.feet - 0.35)
                       continue;
                     const u = (tf - prev.lane.feet) / dF;
-                    let b =
+                    // 直線插值（唔硬吸 14.3——避免假 Arr）；最終靠 smoothDemoPath densify
+                    const b =
                       prev.lane.board + u * (lane.board - prev.lane.board);
-                    // 偏 tony 14–15；避免 coast 停喺 board 21
-                    b = b * 0.4 + 14.4 * 0.6;
-                    if (b < 12 || b > 16) continue;
+                    if (b < 7.5 || b > 24) continue;
                     livePointsRef.current.push({
                       image: {
                         x: prev.image.x + u * (contact.x - prev.image.x),
@@ -1201,13 +1530,18 @@ export default function Workbench() {
               };
               livePointsRef.current.push(tp);
               if (livePointsRef.current.length % 3 === 0) {
-                const path = livePointsRef.current
+                const pbaLive = !!settingsRef.current.boardFromRight;
+                const forUi =
+                  sourceModeRef.current === "upload" && !pbaLive
+                    ? smoothDemoPath(livePointsRef.current)
+                    : livePointsRef.current;
+                const path = forUi
                   .filter((p) => p.lane)
                   .map((p) => p.lane!);
                 setLivePath(path);
                 const rpm = getRpmEstimate(trackerRef.current);
                 setLiveEstimate(
-                  computeShotEstimate(livePointsRef.current, rpm, {
+                  computeShotEstimate(forUi, rpm, {
                     boardFromRight: settingsRef.current.boardFromRight,
                   })
                 );
@@ -1228,13 +1562,50 @@ export default function Workbench() {
             .map((p) => p.lane!.feet);
           const maxLiveFeet =
             liveFeet.length > 0 ? Math.max(...liveFeet) : 0;
+          // bowling-demo：中段 lost 高但未到袋口 → 前進 softRelock（最多兩次）
+          // r6：一次 recover 後仍可喺 ~35′ 死；第二次幫捱到 pins
+          if (
+            sourceModeRef.current === "upload" &&
+            !pbaMode &&
+            midRecoverUsedRef.current < 2 &&
+            trackerRef.current.locked &&
+            trackerRef.current.lost >= (midRecoverUsedRef.current === 0 ? 10 : 12) &&
+            maxLiveFeet >= 14 &&
+            maxLiveFeet < 48 &&
+            trackerRef.current.fastRelockFrames <= 0
+          ) {
+            const sc = trackScaleRef.current;
+            const full = cornersRef.current;
+            if (full) {
+              const work = sc < 1 ? scaleLaneCorners(full, sc) : full;
+              trackerRef.current.softRelockMid(work);
+              livePointsRef.current = livePointsRef.current.filter(
+                (p) => !p.lane || p.lane.feet <= maxLiveFeet + 2
+              );
+              demoInsetActiveRef.current = false;
+              midRecoverUsedRef.current += 1;
+            }
+          }
           // PBA：要捱過變焦先收；未到 ~38′ 用更高 lost 門檻
           const endSettings = pbaMode
             ? {
                 ...settingsRef.current,
                 lostFramesToEnd: maxLiveFeet >= 38 ? 48 : 72,
               }
-            : settingsRef.current;
+            : sourceModeRef.current === "upload"
+              ? {
+                  ...settingsRef.current,
+                  // bowling-demo：中後段多捱；抬高避免 UI 預測衰減後 ~27′ 早收
+                  lostFramesToEnd:
+                    maxLiveFeet >= 40
+                      ? 56
+                      : maxLiveFeet >= 28
+                        ? 50
+                      : maxLiveFeet >= 16
+                          ? 40
+                          : Math.max(settingsRef.current.lostFramesToEnd, 28),
+                }
+              : settingsRef.current;
           if (
             canSaveShot &&
             shouldEndShot(
@@ -1260,6 +1631,31 @@ export default function Workbench() {
                   livePointsRef.current = [];
                   setLivePath([]);
                   setLiveEstimate(null);
+                  trackerRef.current.beginNewShot({ clearBg: true });
+                }
+              }
+            } else if (
+              !pbaMode &&
+              sourceModeRef.current === "upload" &&
+              livePointsRef.current.length > 0
+            ) {
+              // bowling-demo：未 foul→pins 唔收——丟短碎等下一圈／再點球
+              const rawF = livePointsRef.current
+                .filter((pt) => pt.lane && !pt.predicted)
+                .map((pt) => pt.lane!.feet);
+              if (rawF.length >= 2) {
+                const minF = Math.min(...rawF);
+                const maxF = Math.max(...rawF);
+                if (minF > 10 || maxF < 48) {
+                  allowFinish = false;
+                  livePointsRef.current = [];
+                  setLivePath([]);
+                  setLiveEstimate(null);
+                  setStatus(
+                    `覆蓋不足（${minF.toFixed(0)}–${maxF.toFixed(0)}′），繼續追蹤…`
+                  );
+                  midRecoverUsedRef.current = 0;
+                  demoInsetActiveRef.current = true;
                   trackerRef.current.beginNewShot({ clearBg: true });
                 }
               }
@@ -1341,6 +1737,8 @@ export default function Workbench() {
       setLiveEstimate(null);
       const s = trackScaleRef.current || 1;
       trackerRef.current.seedAt({ x: p.x * s, y: p.y * s });
+      midRecoverUsedRef.current = 0;
+      demoInsetActiveRef.current = true;
       shotStartRef.current = performance.now();
       setStatus("已點選球位置，開始跟球…");
       return;
@@ -1402,6 +1800,7 @@ export default function Workbench() {
     gutterRejectStreakRef.current = 0;
     pbaSawHighBoardRef.current = false;
     demoInsetActiveRef.current = true;
+    midRecoverUsedRef.current = 0;
     finishingRef.current = false;
     shotCooldownUntilRef.current = 0;
     loopCycleSavedRef.current = false;

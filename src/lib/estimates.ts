@@ -1,6 +1,7 @@
 import {
   boardAtFeet,
   boardAtFeetDetailed,
+  boardAtFeetOnDisplayedPath,
   earlyBoardSlopeAbs,
   estimateSegmentSpeedMph,
   estimateSpeedMph,
@@ -17,8 +18,8 @@ export type EstimateOptions = {
   boardFromRight?: boolean;
 };
 
-/** RPM 顯示門檻：低於此信心顯示 —（不硬填） */
-const RPM_CONF_SHOW = 0.55;
+/** RPM 顯示門檻：低於此信心顯示 —（不硬填）；Alinejad fuse 用 0.5 */
+const RPM_CONF_SHOW = 0.48;
 
 /** LaneTrax 風格粗估（瀏覽器軌跡推導，非雷達／官方量測） */
 export function computeShotEstimate(
@@ -144,94 +145,17 @@ export function computeShotEstimate(
     }
   }
 
-  // bowling-demo Arrows gate (!pba): require real 12-18' sample OR early-mean ~13.9
-  // Never trust long-span interp (Tester#8: 7@16->18@10.5 span~11' => Arr 12.0/12.2)
+  // bowling-demo Arrows (!pba): Arr MUST equal displayed path board at ~15′
+  // (TesterManual r5: PROBE_TGT 13.7 blend → Arr 13.9 while LaneMap @15′ ≈22).
+  // Sample oriented path INCLUDING smoothDemoPath predicted densify knots —
+  // boardAtFeet / longestForward strip predicted and diverge from LaneMap.
   if (!pba && !pbaArrowsLocked) {
-    const fwdArr = longestForwardLanePoints(points);
-    // densify：predicted apex（softRelock 海岸／board-14 snap）都算 12–18′ 真樣本
-    // longestForwardLanePoints 剔 predicted，否則 Arr 仍靠 earlyMean+clamp
-    // 必須用 oriented（含 predicted）；`points` 已畀 longestForward 剔走預測點
-    const predApex = oriented
-      .filter(
-        (p) =>
-          p.predicted &&
-          p.lane &&
-          p.lane.feet >= 12 &&
-          p.lane.feet <= 18 &&
-          p.lane.board > 10 &&
-          p.lane.board < 18
-      )
-      .map((p) => p.lane!);
-    const inBand = [
-      ...fwdArr.filter(
-        (p) => p.feet >= 12 && p.feet <= 18 && p.board > 8 && p.board < 22
-      ),
-      ...predApex,
-    ];
-    // Clamp optional: densify keeps apex board~14 → can run without hard [13,15]
-    // Set DEMO_ARR_CLAMP=false to verify live×5 still ∈[13,15] from real samples.
-    const DEMO_ARR_CLAMP = false;
-    const clampArr = (v: number): number => {
-      const x = DEMO_ARR_CLAMP ? Math.min(15, Math.max(13, v)) : v;
-      return Math.round(x * 10) / 10;
-    };
-    const PROBE_TGT = 13.7; // near live probe ~13.6–13.9
-    const earlyMeanLocked = (): number | null => {
-      const earlyClean = fwdArr.filter(
-        (p) =>
-          p.feet >= 2 &&
-          p.feet <= 12 &&
-          p.board > 9 &&
-          p.board <= 17.5
-      );
-      if (earlyClean.length < 1) return null;
-      const tonyish = earlyClean.filter(
-        (p) => p.board >= 13 && p.board <= 15
-      );
-      const use = tonyish.length >= 1 ? tonyish : earlyClean;
-      let mean = use.reduce((s, p) => s + p.board, 0) / use.length;
-      // Always blend toward probe when locking without dense apex
-      mean = mean * 0.4 + PROBE_TGT * 0.6;
-      return clampArr(mean);
-    };
-    if (inBand.length >= 1) {
-      const tonyBand = inBand.filter(
-        (p) => p.board >= 13 && p.board <= 15
-      );
-      if (tonyBand.length >= 1) {
-        const best = [...tonyBand].sort(
-          (a, b) => Math.abs(a.feet - 15) - Math.abs(b.feet - 15)
-        )[0];
-        arrowsBoard = clampArr(best.board);
-        if (Math.abs(best.feet - 15) > 1.2) extrapolated.arrows = true;
-        demoArrowsLocked = true;
-      } else {
-        // in-band but outside [13,15] board — prefer early-mean lock
-        const locked = earlyMeanLocked();
-        if (locked != null) {
-          arrowsBoard = locked;
-          extrapolated.arrows = true;
-          demoArrowsLocked = true;
-        } else {
-          const best = [...inBand].sort(
-            (a, b) => Math.abs(a.feet - 15) - Math.abs(b.feet - 15)
-          )[0];
-          arrowsBoard = clampArr(best.board * 0.25 + PROBE_TGT * 0.75);
-          extrapolated.arrows = true;
-          demoArrowsLocked = true;
-        }
-      }
-    } else {
-      const locked = earlyMeanLocked();
-      if (locked != null) {
-        arrowsBoard = locked;
-        extrapolated.arrows = true;
-        demoArrowsLocked = true;
-      } else if (arrowsBoard != null) {
-        arrowsBoard = clampArr(arrowsBoard * 0.25 + PROBE_TGT * 0.75);
-        extrapolated.arrows = true;
-        demoArrowsLocked = true;
-      }
+    const honest = boardAtFeetOnDisplayedPath(oriented, 15, 2.5);
+    if (honest != null && honest > -1 && honest < 40) {
+      arrowsBoard = Math.round(honest * 10) / 10;
+      // Measured on drawn path — not extrapolated fantasy
+      delete extrapolated.arrows;
+      demoArrowsLocked = true;
     }
   }
 

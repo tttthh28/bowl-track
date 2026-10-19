@@ -73,10 +73,14 @@ export function evaluateShotQuality(points: TrackPoint[]): ShotQualityResult {
     };
   }
 
-  if (points.length < MIN_POINTS) {
+  // densify predicted knots must NOT inflate past MIN_POINTS
+  // (TesterManual r6: 6 raw @18–35′ → smoothDemoPath ~18 pts → false ok)
+  // Sparse foul→pins (unseeded ~5 raw / 50′+) still allowed.
+  const minPts = feetSpan >= 40 ? 5 : MIN_POINTS;
+  if (lanePts.length < minPts) {
     return {
       ok: false,
-      reason: `點${points.length}`,
+      reason: `點${lanePts.length}`,
       travelPx,
       feetSpan,
       durationMs,

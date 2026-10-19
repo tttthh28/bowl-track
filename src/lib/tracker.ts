@@ -1,4 +1,11 @@
 import type { LaneCorners, Point2D, TrackerSettings } from "./types";
+import {
+  createSpinState,
+  getSpinEstimate,
+  resetSpinState,
+  updateSpinFromFrame,
+  type SpinEstimateState,
+} from "./spinEstimate";
 
 export const DEFAULT_TRACKER: TrackerSettings = {
   // 對齊 laneProbe（sens26／blob28）：預設 28／35 喺 bowling-demo 只鎖~20點 → Shot Arrows=—
@@ -81,6 +88,8 @@ export class BallTrackerState {
   lastRpmConf = 0;
   /** RPM 鎖定中位值（低信心時不亂跳） */
   rpmLocked: number | null = null;
+  /** Alinejad-port spin (polar + annular flow); mirrors rpm* fields */
+  spinState: SpinEstimateState = createSpinState();
   /** 手動／自動鎖定後才開始累積軌跡 */
   locked = false;
   /** 點選種子（影像座標） */
@@ -115,6 +124,7 @@ export class BallTrackerState {
     this.lastRpm = null;
     this.lastRpmConf = 0;
     this.rpmLocked = null;
+    resetSpinState(this.spinState);
     this.locked = false;
     this.seed = null;
     this.outOfLaneFrames = 0;
@@ -161,6 +171,7 @@ export class BallTrackerState {
     this.lastRpm = null;
     this.lastRpmConf = 0;
     this.rpmLocked = null;
+    resetSpinState(this.spinState);
     if (opts?.clearBg) {
       this.bg = null;
       this.prevGray = null;
@@ -196,6 +207,7 @@ export class BallTrackerState {
     const leftX = corners.bl.x + (corners.tl.x - corners.bl.x) * t;
     const rightX = corners.br.x + (corners.tr.x - corners.br.x) * t;
     // tony 線：瞄準 ~17 影像 X，預測左漂後 apex 落喺 board ~14–15
+    // （路徑 V 由 smoothDemoPath 清；此處硬瞄先保 mid 重鎖／覆蓋）
     const targetX = leftX + (rightX - leftX) * (17 / 39);
     const vy = this.vel.y < -2 ? this.vel.y : (pinY - foulY) * 0.055;
     this.ema = { x: targetX, y };
@@ -643,7 +655,8 @@ export function trackBallFrame(
       predicted = true;
       state.ema = { x: px, y: py };
       state.vel.x *= demoStrict ? 0.5 : 0.9;
-      state.vel.y *= 0.9;
+      // demo：0.92 略慢衰減，畀中段預測多捱幾呎（UI 10–27′）；唔加 minVy 以免飛過真球
+      state.vel.y *= demoStrict ? 0.92 : 0.9;
     }
   } else if (!detected && state.locked) {
     state.lost += 1;
@@ -909,121 +922,18 @@ function updateRpm(
   settings: TrackerSettings,
   dtMs: number
 ) {
-  const BINS = 64;
-  const rMin = 4;
-  const rMax = 18;
-  const polar = new Float32Array(BINS);
-  const counts = new Float32Array(BINS);
-
-  const cx = Math.round(center.x);
-  const cy = Math.round(center.y);
-  for (let dy = -rMax; dy <= rMax; dy++) {
-    for (let dx = -rMax; dx <= rMax; dx++) {
-      const r = Math.hypot(dx, dy);
-      if (r < rMin || r > rMax) continue;
-      const x = cx + dx;
-      const y = cy + dy;
-      if (x < 0 || y < 0 || x >= width || y >= height) continue;
-      let ang = Math.atan2(dy, dx);
-      if (ang < 0) ang += Math.PI * 2;
-      const bin = Math.min(BINS - 1, Math.floor((ang / (Math.PI * 2)) * BINS));
-      polar[bin] += gray[y * width + x];
-      counts[bin] += 1;
-    }
-  }
-  for (let i = 0; i < BINS; i++) {
-    polar[i] = counts[i] > 0 ? polar[i] / counts[i] : 0;
-  }
-
-  let minV = 255;
-  let maxV = 0;
-  for (let i = 0; i < BINS; i++) {
-    if (counts[i] === 0) continue;
-    minV = Math.min(minV, polar[i]);
-    maxV = Math.max(maxV, polar[i]);
-  }
-  const contrast = maxV - minV;
-  if (contrast < settings.rpmMinContrast) {
-    state.prevPolar = polar;
-    return;
-  }
-
-  if (state.prevPolar && state.prevPolar.length === BINS && dtMs > 0) {
-    const shift = circularShift(state.prevPolar, polar);
-    const deg = (shift / BINS) * 360;
-    let dDeg = deg;
-    if (dDeg > 180) dDeg -= 360;
-    if (dDeg < -180) dDeg += 360;
-    const degPerSec = (Math.abs(dDeg) / dtMs) * 1000;
-    const rpm = (degPerSec / 360) * 60;
-    if (rpm >= 40 && rpm <= 800) {
-      state.rpmSamples.push(rpm);
-      if (state.rpmSamples.length > 24) state.rpmSamples.shift();
-      const med = median(state.rpmSamples);
-      const confContrast = Math.min(1, contrast / 60);
-      const confN = Math.min(1, state.rpmSamples.length / 12);
-      const spread = mad(state.rpmSamples, med) / Math.max(1, med);
-      const confStable = Math.max(0, 1 - spread * 2.2);
-      const conf = Math.max(
-        0,
-        Math.min(1, confContrast * 0.4 + confN * 0.3 + confStable * 0.3)
-      );
-      state.lastRpmConf = conf;
-      // 高信心時鎖定區間；低信心不更新顯示值（避免亂跳）
-      if (conf >= 0.55 && state.rpmSamples.length >= 8) {
-        state.rpmLocked = Math.round(med);
-        state.lastRpm = state.rpmLocked;
-      } else if (conf >= 0.42 && state.rpmLocked != null) {
-        // 維持鎖定值，允許小幅靠攏
-        const mix = Math.round(state.rpmLocked * 0.85 + med * 0.15);
-        state.rpmLocked = mix;
-        state.lastRpm = mix;
-      } else if (conf >= 0.42 && state.rpmSamples.length >= 10) {
-        state.lastRpm = Math.round(med);
-      } else {
-        // 信心不足：不輸出亂跳值
-        state.lastRpm = state.rpmLocked;
-        if (state.rpmLocked == null) state.lastRpmConf = Math.min(conf, 0.35);
-      }
-    }
-  }
-  state.prevPolar = polar;
-}
-
-function circularShift(a: Float32Array, b: Float32Array): number {
-  const n = a.length;
-  let ma = 0;
-  let mb = 0;
-  for (let i = 0; i < n; i++) {
-    ma += a[i];
-    mb += b[i];
-  }
-  ma /= n;
-  mb /= n;
-  let best = 0;
-  let bestCorr = -Infinity;
-  for (let s = 0; s < n; s++) {
-    let corr = 0;
-    for (let i = 0; i < n; i++) {
-      corr += (a[i] - ma) * (b[(i + s) % n] - mb);
-    }
-    if (corr > bestCorr) {
-      bestCorr = corr;
-      best = s;
-    }
-  }
-  return best;
-}
-
-function median(arr: number[]): number {
-  const s = [...arr].sort((a, b) => a - b);
-  const m = Math.floor(s.length / 2);
-  return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
-}
-
-function mad(arr: number[], med: number): number {
-  const devs = arr.map((v) => Math.abs(v - med));
-  return median(devs);
+  const sample = updateSpinFromFrame(state.spinState, gray, width, height, center, {
+    dtMs,
+    minContrast: settings.rpmMinContrast,
+    radiusPx: state.radiusEma ?? state.lastRadius,
+  });
+  // Mirror into legacy fields (Workbench / getRpmEstimate)
+  state.prevPolar = state.spinState.prevPolar;
+  state.rpmSamples = state.spinState.samples;
+  state.lastRpm = state.spinState.lastRpm;
+  state.lastRpmConf = state.spinState.lastConf;
+  state.rpmLocked = state.spinState.locked;
+  void sample;
 }
 
 /** 相容舊 API：單純幀差質心 */
@@ -1076,8 +986,13 @@ export function getRpmEstimate(state: BallTrackerState): {
   rpm: number | null;
   confidence: number;
 } {
+  // Prefer Alinejad-port spin state (polar + annular OF fuse)
+  const spun = getSpinEstimate(state.spinState);
+  if (spun.rpm != null && spun.confidence >= 0.48) {
+    return { rpm: spun.rpm, confidence: spun.confidence };
+  }
   const rpm =
-    state.lastRpmConf >= 0.55
+    state.lastRpmConf >= 0.48
       ? state.lastRpm ?? state.rpmLocked
       : null;
   return { rpm, confidence: state.lastRpmConf };
@@ -1096,16 +1011,19 @@ export function shouldEndShot(
 ): boolean {
   if (!hasPoints || !state.locked) return false;
   if (state.lost >= settings.lostFramesToEnd) return true;
-  // PBA：變焦後球離開靜態四角 → outOfLane 會誤殺（覆蓋停 ~25′）；只靠 lost
+  // outOfLane：PBA zoom／demo inset 都易誤殺（覆蓋停 ~24–25′）。
+  // 只喺預設短 lost（≤20）時用；Workbench demo 會抬 lostFrames→跳過。
   if (
     !settings.boardFromRight &&
+    settings.lostFramesToEnd <= 20 &&
     state.outOfLaneFrames >= Math.max(8, Math.floor(settings.lostFramesToEnd * 0.75))
   ) {
     return true;
   }
-  // PBA／變焦：影像上半「pin 區」會誤觸（靜態四角+zoom）→ 覆蓋只剩 28–40′
+  // pin 區早收：同樣要求短 lost 設定；demo 抬 lost 後改靠 lost 門檻捱到袋口
   if (
     !settings.boardFromRight &&
+    settings.lostFramesToEnd <= 20 &&
     state.reachedPinZone &&
     state.lost >= Math.max(5, Math.floor(settings.lostFramesToEnd * 0.45))
   ) {

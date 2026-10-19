@@ -1,12 +1,15 @@
 import type { LaneCorners, Point2D } from "./types";
 import { defaultCorners } from "./perspective";
 import { detectLaneCornersCorra } from "./laneDetectCorra";
+import { detectLaneCornersHough } from "./laneDetectHough";
 
 export type LaneDetectResult = {
   corners: LaneCorners;
   /** 0–1 粗信心；偏低時建議改手動 */
   confidence: number;
   message: string;
+  /** PBA Strike Track 等右欄 HUD：唔好再 demo hard-snap */
+  broadcastHud?: boolean;
 };
 
 /** 標準球道約 60′ × 41.5″ */
@@ -51,8 +54,963 @@ export function frameHasLaneSignal(
 
 
 /**
- * bowling-demo 收斂硬鎖：
- * mid≈0.428、bot≈0.52、foulY 0.84–0.88；upload 拒 board≥28＋解鎖重追。
+ * PBA／FOX Strike Track 等：右欄高亮長矩形 HUD。
+ * 偵測「左暗→右亮」垂直跳變；bowling-demo 木面唔會有呢種跳。
+ */
+export function detectBroadcastHud(
+  rgba: Uint8ClampedArray,
+  width: number,
+  height: number
+): { present: boolean; maskRight: number } {
+  if (width < 160 || height < 120) return { present: false, maskRight: width };
+  const colMean = new Float64Array(width);
+  const y0 = Math.floor(height * 0.18);
+  const y1 = Math.floor(height * 0.82);
+  for (let x = Math.floor(width * 0.55); x < width; x++) {
+    let s = 0;
+    let n = 0;
+    for (let y = y0; y < y1; y += 2) {
+      const i = (y * width + x) * 4;
+      s += (rgba[i] * 77 + rgba[i + 1] * 150 + rgba[i + 2] * 29) >> 8;
+      n++;
+    }
+    colMean[x] = n > 0 ? s / n : 0;
+  }
+  let bestX = -1;
+  let bestJump = 0;
+  for (let x = Math.floor(width * 0.68); x < Math.floor(width * 0.9); x++) {
+    let L = 0;
+    let nL = 0;
+    let R = 0;
+    let nR = 0;
+    for (let dx = 1; dx <= 20; dx++) {
+      L += colMean[x - dx] || 0;
+      nL++;
+    }
+    for (let dx = 1; dx <= 48; dx++) {
+      if (x + dx < width) {
+        R += colMean[x + dx] || 0;
+        nR++;
+      }
+    }
+    const jump = (nR ? R / nR : 0) - (nL ? L / nL : 0);
+    const rightBright = (nR ? R / nR : 0) > 120;
+    if (jump > 45 && rightBright && jump > bestJump) {
+      bestJump = jump;
+      bestX = x;
+    }
+  }
+  const present = bestX > 0 && bestJump > 45;
+  // 右遮罩略縮入 HUD 左緣，避免溝峰吸到面板邊
+  const maskRight = present
+    ? Math.max(Math.floor(width * 0.62), bestX - 6)
+    : width;
+  return { present, maskRight };
+}
+
+function grayFromRgba(
+  rgba: Uint8ClampedArray,
+  width: number,
+  height: number
+): Uint8ClampedArray {
+  const g = new Uint8ClampedArray(width * height);
+  for (let i = 0; i < width * height; i++) {
+    const o = i * 4;
+    g[i] = (rgba[o] * 77 + rgba[o + 1] * 150 + rgba[o + 2] * 29) >> 8;
+  }
+  return g;
+}
+
+function fitLineBroadcast(
+  ys: number[],
+  xs: number[]
+): { a: number; b: number } | null {
+  const n = ys.length;
+  if (n < 4) return null;
+  const fit = (yy: number[], xx: number[]) => {
+    const m = yy.length;
+    let sy = 0,
+      sx = 0,
+      syy = 0,
+      sxy = 0;
+    for (let i = 0; i < m; i++) {
+      sy += yy[i];
+      sx += xx[i];
+      syy += yy[i] * yy[i];
+      sxy += yy[i] * xx[i];
+    }
+    const den = m * syy - sy * sy;
+    if (Math.abs(den) < 1e-6) return null;
+    const b = (m * sxy - sy * sx) / den;
+    const a = (sx - b * sy) / m;
+    return { a, b };
+  };
+  const first = fit(ys, xs);
+  if (!first) return null;
+  const res = ys.map((y, i) => Math.abs(xs[i] - (first.a + first.b * y)));
+  const sorted = [...res].sort((a, b) => a - b);
+  const thr = Math.max(6, (sorted[Math.floor(sorted.length / 2)] || 1) * 2.4);
+  const iy: number[] = [];
+  const ix: number[] = [];
+  for (let i = 0; i < n; i++) {
+    if (res[i] <= thr) {
+      iy.push(ys[i]);
+      ix.push(xs[i]);
+    }
+  }
+  if (iy.length < 5) return first;
+  return fit(iy, ix) ?? first;
+}
+
+/**
+ * 廣播片：遮罩右欄 HUD 後，用溝側 |gx|＋暗 flank 擬合真球道（Corra 風格）。
+ * 拒絕梯形伸入 Strike Track。
+ */
+export function detectLaneCornersBroadcast(
+  rgba: Uint8ClampedArray,
+  width: number,
+  height: number,
+  maskRight: number
+): LaneDetectResult | null {
+  const gray = grayFromRgba(rgba, width, height);
+  const pts: { y: number; l: number; r: number }[] = [];
+  // 用 foul 帶「亮木＋兩側暗溝」估 mid（拒左廣告／鄰道亮帶）
+  let woodMid = Math.min(width * 0.34, maskRight * 0.42);
+  {
+    const yWood = Math.floor(height * 0.64);
+    let bestX = woodMid;
+    let bestSc = -1e9;
+    const x0 = Math.floor(width * 0.18);
+    const x1 = Math.min(maskRight - 24, Math.floor(width * 0.55));
+    const half = Math.floor(width * 0.11);
+    const flank = Math.floor(width * 0.035);
+    for (let x = x0; x < x1; x += 3) {
+      let wood = 0;
+      let nw = 0;
+      for (let dx = -half + 4; dx <= half - 4; dx += 2) {
+        const xx = x + dx;
+        if (xx >= 0 && xx < maskRight) {
+          wood += gray[yWood * width + xx];
+          nw++;
+        }
+      }
+      const woodM = nw > 0 ? wood / nw : 0;
+      let dL = 0;
+      let nL = 0;
+      let dR = 0;
+      let nR = 0;
+      for (let k = 2; k <= flank; k++) {
+        const xl = x - half - k;
+        const xr = x + half + k;
+        if (xl >= 0) {
+          dL += gray[yWood * width + xl];
+          nL++;
+        }
+        if (xr < maskRight) {
+          dR += gray[yWood * width + xr];
+          nR++;
+        }
+      }
+      const darkL = nL ? dL / nL : 99;
+      const darkR = nR ? dR / nR : 99;
+      if (woodM < 50) continue;
+      if (woodM - darkL < 14 || woodM - darkR < 10) continue;
+      const sc =
+        woodM +
+        Math.min(50, woodM - darkL) * 0.6 +
+        Math.min(50, woodM - darkR) * 0.5;
+      if (sc > bestSc) {
+        bestSc = sc;
+        bestX = x;
+      }
+    }
+    if (bestSc > 0) woodMid = bestX;
+  }
+  // 多 mid 種子（0.30/0.34/0.38/0.42）：PBA-01 同 PBA-10 中線差大，單種子會鎖錯簇
+  const midSeeds = [
+    clamp(woodMid, width * 0.28, width * 0.45),
+    width * 0.3,
+    width * 0.34,
+    width * 0.38,
+    width * 0.42,
+  ];
+  type Cand = { y: number; l: number; r: number; m: number; sc: number };
+  const allCands: Cand[] = [];
+  for (const mid0 of midSeeds) {
+    let mid = mid0;
+    for (let yf = 0.78; yf >= 0.32; yf -= 0.025) {
+      const y = Math.round(yf * height);
+      const expectW = width * clamp(0.14 + yf * 0.24, 0.2, 0.36);
+      const xLo = Math.floor(width * 0.1);
+      const xHi = Math.min(maskRight - 4, Math.floor(width * 0.72));
+      if (xHi - xLo < 40) continue;
+      const gx: number[] = [];
+      for (let x = xLo + 1; x < xHi - 1; x++) {
+        gx[x] = Math.abs(gray[y * width + x + 1] - gray[y * width + x - 1]);
+      }
+      let sum = 0;
+      let n = 0;
+      for (let x = xLo; x < xHi; x++) {
+        sum += gx[x] || 0;
+        n++;
+      }
+      const thr = Math.max(9, (n > 0 ? sum / n : 0) * 1.2);
+      const Lcand: { x: number; sc: number }[] = [];
+      const Rcand: { x: number; sc: number }[] = [];
+      for (let x = xLo + 3; x < xHi - 3; x++) {
+        const g = gx[x] || 0;
+        if (g < thr) continue;
+        if (g < (gx[x - 1] || 0) || g < (gx[x + 1] || 0)) continue;
+        const toward = x < mid ? 1 : -1;
+        let out = 0;
+        let inn = 0;
+        let no = 0;
+        let ni = 0;
+        for (let k = 2; k <= 16; k++) {
+          const xo = x - toward * k;
+          const xi = x + toward * k;
+          if (xo >= 0 && xo < width) {
+            out += gray[y * width + xo];
+            no++;
+          }
+          if (xi >= 0 && xi < width) {
+            inn += gray[y * width + xi];
+            ni++;
+          }
+        }
+        const flank = (ni ? inn / ni : 0) - (no ? out / no : 0);
+        if (flank < 10) continue;
+        const sc = g * 0.35 + flank;
+        if (x < mid) Lcand.push({ x, sc });
+        else Rcand.push({ x, sc });
+      }
+      if (!Lcand.length || !Rcand.length) continue;
+      Lcand.sort((a, b) => b.sc - a.sc);
+      Rcand.sort((a, b) => b.sc - a.sc);
+      let best: Cand | null = null;
+      let bs = -1e9;
+      for (const L of Lcand.slice(0, 12)) {
+        for (const R of Rcand.slice(0, 12)) {
+          const ww = R.x - L.x;
+          if (ww < expectW * 0.55 || ww > expectW * 1.55) continue;
+          if (ww / width > 0.4 || ww / width < 0.18) continue;
+          const m = (L.x + R.x) / 2;
+          if (m < width * 0.26 || m > width * 0.48) continue;
+          if (Math.abs(m - mid) > width * 0.16) continue;
+          if (R.x > maskRight - 8) continue;
+          if (L.x < width * 0.12) continue;
+          let darkL = 0;
+          let nDL = 0;
+          let darkR = 0;
+          let nDR = 0;
+          for (let k = 3; k <= 14; k++) {
+            const xl = L.x - k;
+            const xr = R.x + k;
+            if (xl >= 0) {
+              darkL += gray[y * width + xl];
+              nDL++;
+            }
+            if (xr < width && xr < maskRight) {
+              darkR += gray[y * width + xr];
+              nDR++;
+            }
+          }
+          const dL = nDL ? darkL / nDL : 99;
+          const dR = nDR ? darkR / nDR : 99;
+          let wood = 0;
+          let nw = 0;
+          for (let x = L.x + 6; x < R.x - 6; x += 3) {
+            wood += gray[y * width + x];
+            nw++;
+          }
+          const woodM = nw > 0 ? wood / nw : 0;
+          if (woodM < 40) continue;
+          if (woodM - dL < 12 || woodM - dR < 5) continue;
+          const wDiff = ww - expectW;
+          const wPen = wDiff < 0 ? -wDiff * 0.2 : wDiff * 0.04;
+          const gutterDark =
+            Math.min(40, woodM - dL) * 0.45 + Math.min(35, woodM - dR) * 0.3;
+          const sc =
+            L.sc +
+            R.sc -
+            wPen +
+            gutterDark +
+            Math.min(20, ww * 0.04) +
+            (woodM > 60 ? 8 : 0);
+          if (sc > bs) {
+            bs = sc;
+            best = { y, l: L.x, r: R.x, m, sc };
+          }
+        }
+      }
+      if (!best) continue;
+      allCands.push(best);
+      mid = mid * 0.5 + best.m * 0.5;
+    }
+  }
+  if (allCands.length < 8) return null;
+  // 以 mid 聚類：優先單道寬 bot≈0.20–0.28、mid≈0.28–0.42（真溝）
+  allCands.sort((a, b) => a.m - b.m);
+  let bestCluster: Cand[] = [];
+  let bestClusterSc = -1e9;
+  for (let i = 0; i < allCands.length; i++) {
+    const lo = allCands[i].m;
+    const hi = lo + width * 0.055;
+    const cluster = allCands.filter((c) => c.m >= lo && c.m <= hi);
+    if (cluster.length < 5) continue;
+    const med = (xs: number[]) => {
+      const s = [...xs].sort((a, b) => a - b);
+      return s[Math.floor(s.length / 2)];
+    };
+    const medM = med(cluster.map((c) => c.m));
+    const medW = med(cluster.map((c) => c.r - c.l));
+    const botFrac = medW / width;
+    const midFrac = medM / width;
+    let geom = 0;
+    if (botFrac >= 0.24 && botFrac <= 0.34) geom += 40;
+    else if (botFrac >= 0.2 && botFrac <= 0.38) geom += 22;
+    else if (botFrac >= 0.18 && botFrac <= 0.4) geom += 8;
+    else geom -= 25;
+    if (midFrac >= 0.28 && midFrac <= 0.42) geom += 30;
+    else if (midFrac >= 0.26 && midFrac <= 0.46) geom += 12;
+    else geom -= 20;
+    const sc =
+      cluster.reduce((s, c) => s + c.sc, 0) / cluster.length +
+      cluster.length * 1.5 +
+      geom;
+    if (sc > bestClusterSc) {
+      bestClusterSc = sc;
+      bestCluster = cluster;
+    }
+  }
+  const useCluster = bestCluster.length >= 5 ? bestCluster : allCands;
+  // 每條 y 只留最高分
+  const byY = new Map<number, Cand>();
+  for (const c of useCluster) {
+    const prev = byY.get(c.y);
+    if (!prev || c.sc > prev.sc) byY.set(c.y, c);
+  }
+  for (const c of Array.from(byY.values())) pts.push({ y: c.y, l: c.l, r: c.r });
+  if (pts.length < 6) return null;
+  if (pts.length < 6) return null;
+
+  // 剔左／右離群（記分牌邊、內油線）再擬合
+  const med = (xs: number[]) => {
+    const s = [...xs].sort((a, b) => a - b);
+    return s[Math.floor(s.length / 2)];
+  };
+  const medL = med(pts.map((p) => p.l));
+  const medR = med(pts.map((p) => p.r));
+  const mad = (xs: number[], m0: number) => {
+    const d = xs.map((x) => Math.abs(x - m0)).sort((a, b) => a - b);
+    return Math.max(8, d[Math.floor(d.length / 2)] || 8);
+  };
+  const madL = mad(pts.map((p) => p.l), medL);
+  const madR = mad(pts.map((p) => p.r), medR);
+  const inliers = pts.filter(
+    (p) =>
+      Math.abs(p.l - medL) <= madL * 2.8 &&
+      Math.abs(p.r - medR) <= madR * 2.8 &&
+      p.r - p.l >= width * 0.16
+  );
+  const usePts = inliers.length >= 5 ? inliers : pts;
+  if (usePts.length < 5) return null;
+
+  const ys = usePts.map((p) => p.y);
+  const leftFit = fitLineBroadcast(ys, usePts.map((p) => p.l));
+  const rightFit = fitLineBroadcast(ys, usePts.map((p) => p.r));
+  if (!leftFit || !rightFit) return null;
+
+  // 廣播 foul 通常喺 0.58–0.78（廣角後視）；>0.82 易落 approach 令外推縮窄
+  let foulY = height * 0.68;
+  let fe = -1;
+  const foulX1 = Math.min(maskRight, Math.floor(width * 0.58));
+  for (let y = Math.floor(height * 0.55); y < Math.floor(height * 0.8); y++) {
+    let e = 0;
+    for (let x = Math.floor(width * 0.14); x < foulX1; x += 2) {
+      e += Math.abs(
+        gray[Math.min(height - 2, y + 1) * width + x] -
+          gray[Math.max(0, y - 1) * width + x]
+      );
+    }
+    // 輕獎接近 pts 下沿
+    const yBoost = y > height * 0.62 && y < height * 0.75 ? e * 0.08 : 0;
+    if (e + yBoost > fe) {
+      fe = e + yBoost;
+      foulY = y;
+    }
+  }
+  // 若有採樣點：foul 唔好低過最底 sample 太多
+  if (pts.length) {
+    const maxPy = Math.max(...pts.map((p) => p.y));
+    foulY = clamp(foulY, height * 0.55, Math.min(height * 0.8, maxPy + height * 0.06));
+  }
+  // 頂邊要蓋晒成排樽：白點「多段短 run」＝樽列；一大舊亮帶＝廣告／overhead
+  const xAt = (fit: { a: number; b: number }, y: number) => fit.a + fit.b * y;
+  type PinRow = { y: number; wh: number; runs: number; sc: number; x0: number; x1: number };
+  const pinRows: PinRow[] = [];
+  for (let y = Math.floor(height * 0.16); y < Math.floor(height * 0.4); y++) {
+    const lX = xAt(leftFit, y);
+    const rX = xAt(rightFit, y);
+    if (rX - lX < width * 0.06) continue;
+    const x0 = Math.max(4, Math.floor(Math.min(lX, rX) + 2));
+    const x1 = Math.min(maskRight - 4, Math.ceil(Math.max(lX, rX) - 2));
+    if (x1 - x0 < 12) continue;
+    let white = 0;
+    let n = 0;
+    let runs = 0;
+    let inRun = false;
+    let runW = 0;
+    let maxRun = 0;
+    for (let x = x0; x < x1; x++) {
+      const g = gray[y * width + x];
+      n++;
+      if (g > 170) {
+        white++;
+        if (!inRun) {
+          runs++;
+          inRun = true;
+          runW = 1;
+        } else runW++;
+      } else if (inRun) {
+        maxRun = Math.max(maxRun, runW);
+        inRun = false;
+        runW = 0;
+      }
+    }
+    if (inRun) maxRun = Math.max(maxRun, runW);
+    if (n < 8) continue;
+    const wh = white / n;
+    if (wh < 0.05) continue;
+    // 樽：多段 run（≥3）且單 run 唔好佔滿走廊；廣告：1–2 條好闊 run
+    const fatBanner = maxRun > (x1 - x0) * 0.55 || (runs <= 2 && wh > 0.35);
+    const overhead =
+      y < height * 0.19 || (y < height * 0.23 && fatBanner);
+    if (overhead || fatBanner) continue;
+    // 下方要似木面（唔係廣告延續）：拒 overhead 記分牌白帶
+    const yBelow = Math.min(height - 2, y + Math.floor(height * 0.05));
+    let below = 0;
+    let nb = 0;
+    for (let x = x0; x < x1; x += 3) {
+      below += gray[yBelow * width + x];
+      nb++;
+    }
+    const belowM = nb > 0 ? below / nb : 0;
+    if (belowM > 145) continue; // 下面仍然好亮 = 廣告／記分牌帶
+    if (belowM < 35) continue;
+    const runBonus = runs >= 3 ? Math.min(8, runs) * 12 : runs * 3;
+    const sc =
+      wh * 160 +
+      runBonus +
+      (belowM > 50 && belowM < 120 ? 25 : 0) -
+      (y > height * 0.34 ? 30 : 0);
+    pinRows.push({ y, wh, runs, sc, x0, x1 });
+  }
+  let pinY = height * 0.28;
+  if (pinRows.length) {
+    // 由上而下第一個高分白樽帶（蓋樽）；唔好跳去 mid-lane 反光
+    pinRows.sort((a, b) => a.y - b.y);
+    const strong = pinRows.filter((r) => r.runs >= 3 && r.wh >= 0.1);
+    const pool = strong.length ? strong : pinRows;
+    let best = pool[0];
+    let bestSc = -1e9;
+    // 喺最頂 40px 帶內攞最高分（樽頭～樽身），避免 overhead 已被 filter
+    const y0 = pool[0].y;
+    for (const r of pool) {
+      if (r.y > y0 + height * 0.06) break;
+      if (r.sc > bestSc) {
+        bestSc = r.sc;
+        best = r;
+      }
+    }
+    // Prefer uppermost strong pin-head band; only drop if clearly a banner remnant
+    let chosen = best;
+    if (y0 < height * 0.17 && best.runs < 3) {
+      const lower = pool.filter(
+        (r) => r.y > y0 + height * 0.03 && r.runs >= 3 && r.sc >= best.sc * 0.5
+      );
+      if (lower.length) {
+        lower.sort((a, b) => a.y - b.y);
+        chosen = lower[0];
+      }
+    }
+    // Prefer pin HEADS (slightly above strong white band), not necks / mid bodies
+    pinY = clamp(chosen.y - height * 0.015, height * 0.16, height * 0.3);
+  } else {
+    // fallback：走廊內白點最多嘅 y（仍拒過頂）
+    let pe = -1e9;
+    for (let y = Math.floor(height * 0.18); y < Math.floor(height * 0.34); y++) {
+      const lX = xAt(leftFit, y);
+      const rX = xAt(rightFit, y);
+      const x0 = Math.max(4, Math.floor(lX + 2));
+      const x1 = Math.min(maskRight - 4, Math.ceil(rX - 2));
+      if (x1 - x0 < 12) continue;
+      let white = 0;
+      let n = 0;
+      for (let x = x0; x < x1; x += 2) {
+        if (gray[y * width + x] > 170) white++;
+        n++;
+      }
+      const sc = (n ? white / n : 0) * 100;
+      if (sc > pe) {
+        pe = sc;
+        pinY = y;
+      }
+    }
+  }
+  pinY = clamp(pinY, height * 0.16, height * 0.3);
+
+  let tl = clampPt({ x: xAt(leftFit, pinY), y: pinY }, width, height);
+  let tr = clampPt({ x: xAt(rightFit, pinY), y: pinY }, width, height);
+  let bl = clampPt({ x: xAt(leftFit, foulY), y: foulY }, width, height);
+  let br = clampPt({ x: xAt(rightFit, foulY), y: foulY }, width, height);
+
+  // foul 列外推後再向外 snap 真溝（內油線 → 外溝）
+  {
+    const y = Math.round(foulY);
+    const snapSide = (guess: number, side: -1 | 1) => {
+      let bestX = guess;
+      let bestSc = -1e9;
+      const lo = side < 0 ? Math.max(width * 0.1, guess - width * 0.08) : guess - width * 0.03;
+      const hi =
+        side < 0
+          ? guess + width * 0.03
+          : Math.min(maskRight - 6, guess + width * 0.1);
+      for (let x = Math.floor(lo); x <= Math.floor(hi); x++) {
+        const g = Math.abs(
+          gray[y * width + Math.min(width - 1, x + 1)] -
+            gray[y * width + Math.max(0, x - 1)]
+        );
+        let out = 0;
+        let inn = 0;
+        let no = 0;
+        let ni = 0;
+        for (let k = 2; k <= 14; k++) {
+          const xo = x + side * k; // side -1: outside left
+          const xi = x - side * k;
+          if (xo >= 0 && xo < width) {
+            out += gray[y * width + xo];
+            no++;
+          }
+          if (xi >= 0 && xi < width) {
+            inn += gray[y * width + xi];
+            ni++;
+          }
+        }
+        const flank = (ni ? inn / ni : 0) - (no ? out / no : 0);
+        if (flank < 8) continue;
+        // 偏外加分
+        const outer = side < 0 ? guess - x : x - guess;
+        const sc = g * 0.4 + flank + Math.max(0, outer) * 0.15;
+        if (sc > bestSc) {
+          bestSc = sc;
+          bestX = x;
+        }
+      }
+      return bestX;
+    };
+    const newL = snapSide(bl.x, -1);
+    const newR = snapSide(br.x, 1);
+    const ww = newR - newL;
+    if (ww >= width * 0.16 && ww <= width * 0.36 && newR < maskRight - 4) {
+      // 同步按斜率平移頂角
+      const dL = newL - bl.x;
+      const dR = newR - br.x;
+      bl = { ...bl, x: newL };
+      br = { ...br, x: newR };
+      tl = { ...tl, x: tl.x + dL * 0.7 };
+      tr = { ...tr, x: tr.x + dR * 0.7 };
+    }
+  }
+
+  // 頂邊蓋樽：透視頂寬 ≈ bot×0.80–0.90，頂 mid 略右偏（廣播機位）
+  {
+    const botW0 = Math.max(1, br.x - bl.x);
+    const foulMid = (bl.x + br.x) / 2;
+    const targetTopW = clamp(botW0 * 0.84, botW0 * 0.72, botW0 * 0.92);
+    const skew = clamp((maskRight * 0.5 - foulMid) * 0.4, 0, width * 0.12);
+    const topMid = clamp(foulMid + skew, width * 0.3, maskRight * 0.6);
+    const half = targetTopW / 2;
+    tl = { ...tl, x: topMid - half };
+    tr = { ...tr, x: Math.min(topMid + half, maskRight - 4) };
+  }
+  // 硬拒 HUD 區
+  const capX = maskRight - 2;
+  bl = { ...bl, x: Math.min(bl.x, capX) };
+  br = { ...br, x: Math.min(br.x, capX) };
+  tl = { ...tl, x: Math.min(tl.x, capX) };
+  tr = { ...tr, x: Math.min(tr.x, capX) };
+  if (tl.x > tr.x) {
+    const t = tl.x;
+    tl = { ...tl, x: tr.x };
+    tr = { ...tr, x: t };
+  }
+  if (bl.x > br.x) {
+    const t = bl.x;
+    bl = { ...bl, x: br.x };
+    br = { ...br, x: t };
+  }
+
+  const botW = br.x - bl.x;
+  let topW = tr.x - tl.x;
+  // 拒薄楔（<16%）同過闊（鄰道／HUD）
+  if (botW < width * 0.16 || botW > width * 0.4 || topW < width * 0.06) {
+    return null;
+  }
+  if (br.x > maskRight || tr.x > maskRight) return null;
+  // 梯形要似球道：底寬於頂、中線唔好飛去右欄／左記分牌
+  const midBot = (bl.x + br.x) / 2;
+  let midTop = (tl.x + tr.x) / 2;
+  if (midBot / width > 0.5 || midBot / width < 0.24) return null;
+  // 頂中線偏離：只輕推，保留外推溝（唔好收成中楔）
+  if (Math.abs(midTop - midBot) / width > 0.14) {
+    const half = Math.max(topW / 2, botW * 0.28);
+    tl = { ...tl, x: midBot - half };
+    tr = { ...tr, x: midBot + half };
+    topW = tr.x - tl.x;
+    midTop = midBot;
+  }
+  // 頂過尖／過闊：PBA 廣角後視 top/bot 可到 ~0.85；舊 0.7 上限會壓成窄楔
+  {
+    const tw = tr.x - tl.x;
+    const ratio = tw / Math.max(1, botW);
+    if (ratio < 0.32 || ratio > 0.92) {
+      const target = clamp(ratio < 0.32 ? 0.45 : 0.78, 0.4, 0.85);
+      const half = (botW * target) / 2;
+      const m = (bl.x + br.x) / 2;
+      tl = { ...tl, x: m - half };
+      tr = { ...tr, x: m + half };
+    }
+  }
+  if (botW <= tr.x - tl.x + 1) return null;
+
+  let confidence = 0.42 + Math.min(0.28, pts.length * 0.012);
+  if (br.x < maskRight * 0.92) confidence += 0.08;
+  // 貼近真溝寬／中線加分
+  if (botW / width >= 0.18 && botW / width <= 0.32) confidence += 0.06;
+  if (midBot / width >= 0.3 && midBot / width <= 0.45) confidence += 0.04;
+  confidence = clamp(confidence, 0.35, 0.85);
+
+  return {
+    corners: { tl, tr, br, bl },
+    confidence,
+    message: `廣播球道（遮罩右欄 HUD，底寬${((botW / width) * 100).toFixed(0)}%）`,
+    broadcastHud: true,
+  };
+}
+
+/** 已係廣播／左偏單道幾何 → 唔好再用 demo hard-snap 蓋掉 */
+export function looksLikeBroadcastLane(
+  corners: LaneCorners,
+  width: number
+): boolean {
+  const botW = corners.br.x - corners.bl.x;
+  const botFrac = botW / Math.max(1, width);
+  const midBot = (corners.bl.x + corners.br.x) / 2 / Math.max(1, width);
+  const brFrac = corners.br.x / Math.max(1, width);
+  return (
+    botFrac >= 0.15 &&
+    botFrac <= 0.4 &&
+    midBot >= 0.24 &&
+    midBot <= 0.48 &&
+    brFrac <= 0.62
+  );
+}
+
+/** 四角坐喺右欄 HUD／記分牌矩形上 */
+export function cornersHitBroadcastHud(
+  corners: LaneCorners,
+  width: number,
+  height: number,
+  maskRight?: number
+): boolean {
+  const pinY = (corners.tl.y + corners.tr.y) / 2;
+  const topW = corners.tr.x - corners.tl.x;
+  const brFrac = corners.br.x / Math.max(1, width);
+  const trFrac = corners.tr.x / Math.max(1, width);
+
+  // 無明確 HUD 遮罩：只罰極端右欄（demo snap BR≈0.756 唔好誤殺）
+  if (maskRight == null || maskRight >= width * 0.95) {
+    if (brFrac > 0.85 || trFrac > 0.88) return true;
+    if (
+      pinY < height * 0.1 &&
+      topW / width > 0.28 &&
+      trFrac > 0.72
+    ) {
+      return true;
+    }
+    return false;
+  }
+
+  const mr = maskRight;
+  const inHud = (p: Point2D) => p.x >= mr - width * 0.02;
+  if (inHud(corners.br) || inHud(corners.tr)) return true;
+  if (corners.br.x > mr && corners.bl.x < width * 0.45) return true;
+  if (pinY < height * 0.12 && topW / width > 0.2 && corners.tr.x > width * 0.62) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Broadcast lane-mask overlay (PBA-10 style): synthetic mid-lane trapezoid graphic
+ * burned into the video — NOT Strike Track side panel, NOT true gutters.
+ * Signals: weak dark-outside gutters, no pin-head whites near top, short floating
+ * extent / cuts bowler. Prefer fail→manual over locking the overlay.
+ */
+export function isLaneMaskOverlay(
+  corners: LaneCorners,
+  rgba: Uint8ClampedArray,
+  width: number,
+  height: number,
+  maskRight: number = width
+): boolean {
+  if (width < 80 || height < 80 || rgba.length < width * height * 4) return false;
+  const botW = corners.br.x - corners.bl.x;
+  const topW = corners.tr.x - corners.tl.x;
+  const botFrac = botW / Math.max(1, width);
+  const taper = topW / Math.max(1e-3, botW);
+  const pinY = (corners.tl.y + corners.tr.y) / 2;
+  const foulY = (corners.bl.y + corners.br.y) / 2;
+  const extent = (foulY - pinY) / Math.max(1, height);
+  const mr = Math.min(width - 1, Math.max(8, maskRight));
+
+  // Sample gray flanks along L/R edges: true gutter = outside darker than inside
+  let flankOk = 0;
+  let flankBad = 0;
+  let bowlerCut = 0;
+  for (const t of [0.2, 0.45, 0.7]) {
+    const y = Math.round(pinY + (foulY - pinY) * t);
+    if (y < 2 || y >= height - 2) continue;
+    const xL = corners.tl.x + (corners.bl.x - corners.tl.x) * t;
+    const xR = corners.tr.x + (corners.br.x - corners.tr.x) * t;
+    const sampleFlank = (x: number, side: -1 | 1) => {
+      const xi = Math.round(x);
+      if (xi < 6 || xi >= mr - 6) return { flank: 0, out: 0, inn: 0 };
+      let out = 0,
+        inn = 0,
+        no = 0,
+        ni = 0;
+      for (let k = 3; k <= 18; k++) {
+        const xo = Math.round(xi + side * k);
+        const xii = Math.round(xi - side * k);
+        if (xo >= 0 && xo < mr) {
+          const o = (y * width + xo) * 4;
+          out += (rgba[o] * 77 + rgba[o + 1] * 150 + rgba[o + 2] * 29) >> 8;
+          no++;
+        }
+        if (xii >= 0 && xii < mr) {
+          const o = (y * width + xii) * 4;
+          inn += (rgba[o] * 77 + rgba[o + 1] * 150 + rgba[o + 2] * 29) >> 8;
+          ni++;
+        }
+      }
+      const outM = no ? out / no : 0;
+      const innM = ni ? inn / ni : 0;
+      return { flank: innM - outM, out: outM, inn: innM };
+    };
+    const L = sampleFlank(xL, -1);
+    const R = sampleFlank(xR, 1);
+    if (L.flank > 18) flankOk++;
+    else if (L.flank < 8) flankBad++;
+    if (R.flank > 18) flankOk++;
+    else if (R.flank < 8) flankBad++;
+
+    // Bowler cut: left edge through saturated / bright non-wood mid torso band
+    if (t >= 0.35 && t <= 0.75 && botFrac < 0.36) {
+      const xi = Math.round(xL);
+      if (xi >= 2 && xi < mr - 2) {
+        const o = (y * width + xi) * 4;
+        const r = rgba[o],
+          g = rgba[o + 1],
+          b = rgba[o + 2];
+        const max = Math.max(r, g, b);
+        const min = Math.min(r, g, b);
+        const sat = max === 0 ? 0 : (max - min) / max;
+        const warmWood = r >= g - 8 && r >= b && g >= b - 20 && sat <= 0.55;
+        // jersey / skin / bright clothing — not lane wood
+        if (max > 90 && !warmWood && (sat > 0.28 || (g > r + 15 && g > b))) {
+          bowlerCut++;
+        }
+      }
+    }
+  }
+
+  // Pin-head whites near top corridor
+  let pinRuns = 0;
+  let pinWhite = 0;
+  let pinN = 0;
+  const y0 = Math.max(2, Math.floor(pinY - height * 0.03));
+  const y1 = Math.min(height - 2, Math.ceil(pinY + height * 0.05));
+  for (let y = y0; y < y1; y += 2) {
+    const tt = (y - pinY) / Math.max(1e-3, foulY - pinY);
+    const xL = corners.tl.x + (corners.bl.x - corners.tl.x) * Math.max(0, Math.min(1, tt));
+    const xR = corners.tr.x + (corners.br.x - corners.tr.x) * Math.max(0, Math.min(1, tt));
+    const xa = Math.max(2, Math.floor(Math.min(xL, xR) + 2));
+    const xb = Math.min(mr - 2, Math.ceil(Math.max(xL, xR) - 2));
+    if (xb - xa < 10) continue;
+    let inRun = false;
+    for (let x = xa; x < xb; x += 2) {
+      const o = (y * width + x) * 4;
+      const g = (rgba[o] * 77 + rgba[o + 1] * 150 + rgba[o + 2] * 29) >> 8;
+      pinN++;
+      if (g > 175) {
+        pinWhite++;
+        if (!inRun) {
+          pinRuns++;
+          inRun = true;
+        }
+      } else inRun = false;
+    }
+  }
+  const pinFrac = pinN ? pinWhite / pinN : 0;
+  const hasPins = pinRuns >= 4 && pinFrac >= 0.06;
+
+  // True pins often sit ABOVE a mid-lane mask top — search wider corridor above TL/TR
+  let pinsAbove = 0;
+  const yA0 = Math.max(2, Math.floor(height * 0.12));
+  const yA1 = Math.max(yA0 + 4, Math.floor(pinY - height * 0.02));
+  const midTop = (corners.tl.x + corners.tr.x) / 2;
+  for (let y = yA0; y < yA1; y += 2) {
+    const xa = Math.max(2, Math.floor(midTop - width * 0.18));
+    const xb = Math.min(mr - 2, Math.ceil(midTop + width * 0.18));
+    let runs = 0;
+    let inn = false;
+    let wh = 0;
+    let n = 0;
+    for (let x = xa; x < xb; x += 2) {
+      const o = (y * width + x) * 4;
+      const g = (rgba[o] * 77 + rgba[o + 1] * 150 + rgba[o + 2] * 29) >> 8;
+      n++;
+      if (g > 175) {
+        wh++;
+        if (!inn) {
+          runs++;
+          inn = true;
+        }
+      } else inn = false;
+    }
+    if (n > 20 && runs >= 3 && wh / n >= 0.05) pinsAbove++;
+  }
+  const pinsAboveTop = pinsAbove >= 2;
+
+  const midBotF = (corners.bl.x + corners.br.x) / 2 / width;
+  const midTopF = (corners.tl.x + corners.tr.x) / 2 / width;
+  const midSkew = Math.abs(midTopF - midBotF);
+
+  // Inset: dark gutter exists clearly outside claimed L/R at mid height
+  let insetGutter = 0;
+  {
+    const y = Math.round((pinY + foulY) / 2);
+    const xL = (corners.tl.x + corners.bl.x) / 2;
+    const xR = (corners.tr.x + corners.br.x) / 2;
+    const gAt = (x: number) => {
+      const xi = Math.round(x);
+      if (xi < 0 || xi >= mr) return 255;
+      const o = (y * width + xi) * 4;
+      return (rgba[o] * 77 + rgba[o + 1] * 150 + rgba[o + 2] * 29) >> 8;
+    };
+    // look further outside for darker channel
+    let darkL = 0,
+      nL = 0,
+      darkR = 0,
+      nR = 0;
+    for (let k = 20; k <= Math.floor(width * 0.1); k += 4) {
+      darkL += gAt(xL - k);
+      nL++;
+      darkR += gAt(xR + k);
+      nR++;
+    }
+    const outL = nL ? darkL / nL : 255;
+    const outR = nR ? darkR / nR : 255;
+    const inL = gAt(xL + 10);
+    const inR = gAt(xR - 10);
+    if (outL + 25 < inL && outL < 70) insetGutter++;
+    if (outR + 25 < inR && outR < 70) insetGutter++;
+  }
+
+  let hits = 0;
+  // Classic PBA lane-mask: narrow–mid bot, fat taper, weak / inverted gutters
+  if (botFrac >= 0.16 && botFrac <= 0.36 && taper >= 0.55 && flankBad >= flankOk) {
+    hits += 2;
+  }
+  // Near-parallel / soft-perspective overlay wedge
+  if (botFrac < 0.32 && taper > 0.7) hits += 2;
+  if (botFrac < 0.3 && taper > 0.55 && taper < 0.7 && midSkew > 0.1) hits += 2;
+  // Floating short wedge
+  if (extent < 0.36 && taper > 0.65 && botFrac < 0.34) hits += 2;
+  // Claimed top misses real pin row (pins sit above)
+  if (pinsAboveTop) hits += 2;
+  // No pin heads at claimed top
+  if (!hasPins && pinY > height * 0.2 && pinY < height * 0.36) hits += 1;
+  if (bowlerCut >= 1) hits += 2;
+  // Gutters clearly wrong
+  if (flankBad >= flankOk + 1 && botFrac < 0.38) hits += 2;
+  if (flankOk === 0 && flankBad >= 2 && botFrac < 0.38) hits += 1;
+  // Huge top/bot mid skew on narrow bot = mask / wrong lane
+  if (midSkew > 0.12 && botFrac < 0.35) hits += 2;
+  // True gutters sit outside claimed edges
+  if (insetGutter >= 1 && botFrac < 0.36) hits += 2;
+  // Geometric mid-wedge (no rgba): left not outer / mid bot / top short
+  const leftFrac = corners.bl.x / width;
+  if (botFrac < 0.38 && leftFrac > 0.24 && midBotF > 0.36) hits += 2;
+  if (botFrac < 0.36 && midBotF > 0.4) hits += 2;
+  if (pinY > height * 0.22 && extent < 0.52 && botFrac < 0.38 && leftFrac > 0.22)
+    hits += 2;
+
+  return hits >= 3;
+}
+
+/**
+ * Pure-geometry mid-lane narrow wedge (PBA-10 style) — NO rgba required.
+ * Cuts bowler / left not on outer lip / top short of pins / mid bot.
+ * Prefer fail→manual even when isLaneMaskOverlay is false.
+ */
+export function isNarrowMidLaneWedge(
+  corners: LaneCorners,
+  width: number,
+  height: number
+): boolean {
+  const botW = corners.br.x - corners.bl.x;
+  const topW = corners.tr.x - corners.tl.x;
+  const botFrac = botW / Math.max(1, width);
+  const midBot = (corners.bl.x + corners.br.x) / 2 / Math.max(1, width);
+  const midTop = (corners.tl.x + corners.tr.x) / 2 / Math.max(1, width);
+  const pinY = (corners.tl.y + corners.tr.y) / 2 / Math.max(1, height);
+  const foulY = (corners.bl.y + corners.br.y) / 2 / Math.max(1, height);
+  const extent = foulY - pinY;
+  const taper = topW / Math.max(1e-3, botW);
+  const leftFrac = corners.bl.x / Math.max(1, width);
+  const tlFrac = corners.tl.x / Math.max(1, width);
+  const brFrac = corners.br.x / Math.max(1, width);
+
+  let hits = 0;
+  // Narrow + mid-centered bot
+  if (botFrac < 0.36 && midBot > 0.4) hits += 2;
+  if (botFrac < 0.38 && leftFrac > 0.18 && midBot > 0.36) hits += 2;
+  // Left edge not on outer lip (true PBA left foul lip often ≤0.18)
+  if (botFrac < 0.42 && leftFrac > 0.22) hits += 2;
+  if (botFrac < 0.4 && leftFrac > 0.18 && midBot > 0.34) hits += 1;
+  // TL also inset
+  if (botFrac < 0.4 && tlFrac > 0.28) hits += 1;
+  // Top short of pin heads
+  if (pinY > 0.2 && pinY < 0.42 && extent < 0.55 && botFrac < 0.4) hits += 2;
+  // Soft / near-parallel taper on mid-width bot (not true vanishing gutters)
+  if (botFrac < 0.42 && taper > 0.78) hits += 2;
+  if (botFrac < 0.36 && taper > 0.68) hits += 1;
+  if (extent < 0.36 && taper > 0.65 && botFrac < 0.34) hits += 2;
+  // Asymmetric: BR near right, BL mid-lane
+  if (brFrac > 0.52 && leftFrac > 0.2 && botFrac < 0.42) hits += 2;
+  // Strong mid skew on narrow bot
+  if (Math.abs(midTop - midBot) > 0.12 && botFrac < 0.38) hits += 1;
+
+  return hits >= 3;
+}
+
+/**
+ * Geometry snap — Hough / gutter-fit refine (NO green/red UI paint lock).
+ * Broadcast HUD frames: keep broadcast fit; never demo hard-snap onto Strike Track.
+ * General lanes: refine L/R from |gx|+flank along perspective; foul/pins from votes.
  */
 export function snapCornersToTrueGutter(
   corners: LaneCorners,
@@ -61,37 +1019,196 @@ export function snapCornersToTrueGutter(
   gray?: Uint8ClampedArray,
   sw?: number,
   sh?: number,
-  scale?: number
+  scale?: number,
+  rgba?: Uint8ClampedArray
 ): LaneCorners {
+  // PBA Strike Track：保留廣播擬合／拒絕再蓋 demo 校準（否則 BR 坐 HUD）
+  // BUT reject broadcast lane-mask mid-wedges (PBA-10) — fall through / keep input only if clean
+  if (looksLikeBroadcastLane(corners, width)) {
+    if (isNarrowMidLaneWedge(corners, width, height)) {
+      // Mid-wedge: do not preserve — fall through to replace / caller null
+    } else if (
+      !rgba ||
+      rgba.length < width * height * 4 ||
+      !isLaneMaskOverlay(corners, rgba, width, height)
+    ) {
+      return corners;
+    }
+    // lane-mask lock: try to replace below; if nothing better, keep (caller may null)
+  }
+  if (rgba && rgba.length >= width * height * 4) {
+    const hud = detectBroadcastHud(rgba, width, height);
+    if (hud.present) {
+      const bcast = detectLaneCornersBroadcast(
+        rgba,
+        width,
+        height,
+        hud.maskRight
+      );
+      if (
+        bcast &&
+        !cornersHitBroadcastHud(bcast.corners, width, height, hud.maskRight) &&
+        !isLaneMaskOverlay(bcast.corners, rgba, width, height, hud.maskRight) &&
+        !isNarrowMidLaneWedge(bcast.corners, width, height)
+      ) {
+        return bcast.corners;
+      }
+      if (
+        !cornersHitBroadcastHud(corners, width, height, hud.maskRight) &&
+        !isLaneMaskOverlay(corners, rgba, width, height, hud.maskRight) &&
+        !isNarrowMidLaneWedge(corners, width, height)
+      ) {
+        return corners;
+      }
+      // Prefer Hough under HUD mask (still reject lane-mask geometry)
+      const houghHud = detectLaneCornersHough(
+        rgba,
+        width,
+        height,
+        hud.maskRight,
+        { broadcastHint: true }
+      );
+      if (
+        houghHud &&
+        !cornersHitBroadcastHud(houghHud.corners, width, height, hud.maskRight) &&
+        !isLaneMaskOverlay(houghHud.corners, rgba, width, height, hud.maskRight) &&
+        !isNarrowMidLaneWedge(houghHud.corners, width, height)
+      ) {
+        return houghHud.corners;
+      }
+      // Prefer fail→manual over returning mid-wedge
+      if (isNarrowMidLaneWedge(corners, width, height)) {
+        return corners; // caller should null; keep shape only if no better
+      }
+      return corners;
+    }
+  }
+
+  // If input already Hough-ish, keep going to gray refine below (don't re-accept raw).
+
   const s = scale ?? Math.min(1, 320 / width);
   const sw0 = sw ?? Math.max(40, Math.round(width * s));
   const sh0 = sh ?? Math.max(40, Math.round(height * s));
   const inv = 1 / s;
-  let bl = { x: corners.bl.x * s, y: corners.bl.y * s };
-  let br = { x: corners.br.x * s, y: corners.br.y * s };
-  const trajMid = sw0 * 0.428;
-  const leftHalf = sw0 * 0.255;
-  const rightHalf = sw0 * 0.265;
-  // 底唔好高過 foul：下限 0.84（舊 0.78 目視「底高過 foul」）
-  // 真 foul≈0.84–0.88；偵測常偏 0.91（過低）或舊 0.78（高過 foul）
-  const foulY = clamp(Math.max(bl.y, br.y, sh0 * 0.84), sh0 * 0.84, sh0 * 0.88);
-  const g =
-    gray && gray.length >= sw0 * sh0
-      ? measureFoulGutterPair(gray, sw0, Math.round(foulY), trajMid)
-      : null;
-  void g;
-  bl = { x: trajMid - leftHalf, y: foulY };
-  br = { x: trajMid + rightHalf, y: foulY };
-  const pinTarget = clamp(sh0 * 0.11, sh0 * 0.09, sh0 * 0.125);
-  const topHalf = sw0 * 0.08;
-  const tl = { x: trajMid - topHalf, y: pinTarget };
-  const tr = { x: trajMid + topHalf, y: pinTarget };
-  return {
-    tl: clampPt({ x: tl.x * inv, y: tl.y * inv }, width, height),
-    tr: clampPt({ x: tr.x * inv, y: tr.y * inv }, width, height),
-    br: clampPt({ x: br.x * inv, y: br.y * inv }, width, height),
-    bl: clampPt({ x: bl.x * inv, y: bl.y * inv }, width, height),
-  };
+  const foulY = clamp(
+    Math.max(corners.bl.y * s, corners.br.y * s, sh0 * 0.86),
+    sh0 * 0.84,
+    sh0 * 0.92
+  );
+  const pinTarget = clamp(
+    ((corners.tl.y + corners.tr.y) / 2) * s,
+    sh0 * 0.092,
+    sh0 * 0.102
+  );
+
+  // If input already looks like true outer gutters, keep L/R and only fix pin mid.
+  // Do NOT inset a good Hough left edge via fitSingleLaneGutters (prior FAIL).
+  {
+    const botW0 = corners.br.x - corners.bl.x;
+    const mid0 = (corners.bl.x + corners.br.x) / 2 / width;
+    const botFrac0 = botW0 / width;
+    const pinY0 = (corners.tl.y + corners.tr.y) / 2;
+    const outerGood =
+      botFrac0 >= 0.5 &&
+      botFrac0 <= 0.66 &&
+      mid0 >= 0.44 &&
+      mid0 <= 0.54 &&
+      pinY0 >= height * 0.078 &&
+      pinY0 <= height * 0.12;
+    if (outerGood) {
+      const midF = (corners.bl.x + corners.br.x) / 2;
+      const botW = botW0;
+      let topW = corners.tr.x - corners.tl.x;
+      let midP = (corners.tl.x + corners.tr.x) / 2;
+      const taper = topW / Math.max(1, botW);
+      const skewTarget = midF + width * 0.14;
+      // Manual / no-image: keep corners unchanged (idempotent keptEqual)
+      if (!gray && !rgba) {
+        return corners;
+      }
+      if (taper < 0.22 || taper > 0.36 || midP < width * 0.50 || midP > width * 0.70) {
+        topW = botW * 0.30;
+        midP = clamp(skewTarget, width * 0.52, width * 0.68);
+      } else {
+        midP = clamp(midP * 0.4 + skewTarget * 0.6, width * 0.52, width * 0.68);
+        topW = clamp(topW, botW * 0.24, botW * 0.34);
+      }
+      // Clamp TL/TR to foul-anchored lips @ pin-head Y (never lane-number masking)
+      const py = clamp(Math.max(pinY0, height * 0.094), height * 0.094, height * 0.100);
+      const fy = clamp(
+        (corners.bl.y + corners.br.y) / 2,
+        height * 0.82,
+        height * 0.94
+      );
+      const tlX = midP - topW / 2;
+      const trX = midP + topW / 2;
+      return {
+        tl: clampPt({ x: tlX, y: py }, width, height),
+        tr: clampPt({ x: trX, y: py }, width, height),
+        br: clampPt({ x: corners.br.x, y: fy }, width, height),
+        bl: clampPt({ x: corners.bl.x, y: fy }, width, height),
+      };
+    }
+  }
+
+  // Geometry fit from gray (no hardcoded paint coords) — prefer OUTER gutters
+  if (gray && gray.length >= sw0 * sh0) {
+    const seedMid = ((corners.bl.x + corners.br.x) / 2) * s;
+    const fit = fitSingleLaneGutters(gray, sw0, sh0, seedMid);
+    if (fit) {
+      const xAt = (side: "l" | "r", y: number) =>
+        side === "l" ? fit.la + fit.lb * y : fit.ra + fit.rb * y;
+      let fBL = xAt("l", foulY);
+      let fBR = xAt("r", foulY);
+      let botW = fBR - fBL;
+      let midF = (fBL + fBR) / 2;
+      // Only shrink clearly two-lane (>0.68); keep true gutters ~0.50–0.64
+      if (botW > sw0 * 0.68) {
+        const target = sw0 * 0.56;
+        const shrink = (botW - target) * 0.45;
+        fBL += shrink / 2;
+        fBR -= shrink / 2;
+        botW = fBR - fBL;
+        midF = (fBL + fBR) / 2;
+      }
+      let fTL = xAt("l", pinTarget);
+      let fTR = xAt("r", pinTarget);
+      let topW = fTR - fTL;
+      let midP = (fTL + fTR) / 2;
+      const taper = topW / Math.max(1e-3, botW);
+      if (taper < 0.22 || taper > 0.36 || !Number.isFinite(topW)) {
+        topW = botW * 0.30;
+        const skewTarget = midF + sw0 * 0.14;
+        midP = clamp(skewTarget, sw0 * 0.50, sw0 * 0.68);
+        fTL = midP - topW / 2;
+        fTR = midP + topW / 2;
+      } else {
+        const skewTarget = midF + sw0 * 0.14;
+        midP = clamp(midP * 0.4 + skewTarget * 0.6, sw0 * 0.50, sw0 * 0.68);
+        topW = clamp(topW, botW * 0.24, botW * 0.34);
+        fTL = midP - topW / 2;
+        fTR = midP + topW / 2;
+      }
+      const midFrac = midF / sw0;
+      if (
+        botW >= sw0 * 0.48 &&
+        botW <= sw0 * 0.68 &&
+        midFrac >= 0.42 &&
+        midFrac <= 0.56 &&
+        fTL < fTR
+      ) {
+        return {
+          tl: clampPt({ x: fTL * inv, y: pinTarget * inv }, width, height),
+          tr: clampPt({ x: fTR * inv, y: pinTarget * inv }, width, height),
+          br: clampPt({ x: fBR * inv, y: foulY * inv }, width, height),
+          bl: clampPt({ x: fBL * inv, y: foulY * inv }, width, height),
+        };
+      }
+    }
+  }
+
+  // Keep input corners (manual / prior auto) — no paint hard-snap
+  return corners;
 }
 
 export function detectLaneCorners(
@@ -102,7 +1219,145 @@ export function detectLaneCorners(
   if (width < 80 || height < 80) return null;
   if (!frameHasLaneSignal(rgba, width, height)) return null;
 
-  // Corra 邊線核心（溝對 + foul／pins 交點）；失敗再走亮段
+  // PBA Strike Track：優先廣播路徑（遮罩右欄＋真溝），拒絕 HUD 矩形
+  const hud = detectBroadcastHud(rgba, width, height);
+  if (hud.present) {
+    const masks = [
+      hud.maskRight,
+      Math.min(width - 2, hud.maskRight + Math.floor(width * 0.03)),
+      Math.max(Math.floor(width * 0.62), hud.maskRight - Math.floor(width * 0.04)),
+      Math.floor(width * 0.78),
+    ];
+    let bcast: LaneDetectResult | null = null;
+    const scoreB = (c: LaneCorners) => {
+      const bot = (c.br.x - c.bl.x) / width;
+      const top = (c.tr.x - c.tl.x) / width;
+      const pinY = (c.tl.y + c.tr.y) / 2 / height;
+      const foulY = (c.bl.y + c.br.y) / 2 / height;
+      const mid = (c.bl.x + c.br.x) / 2 / width;
+      const taper = top / Math.max(1e-3, bot);
+      const extent = foulY - pinY;
+      let sc = 0;
+      // Prefer true gutters covering pin row — NOT mid-lane broadcast mask wedges
+      if (bot >= 0.26 && bot <= 0.38) sc += 35;
+      else if (bot >= 0.22 && bot <= 0.42) sc += 18;
+      else sc -= 25;
+      if (pinY >= 0.16 && pinY <= 0.28) sc += 50;
+      else if (pinY >= 0.28 && pinY <= 0.34) sc += 15; // often mask / mid
+      else if (pinY < 0.14) sc -= 80; // scoreboard lock
+      else sc -= 10;
+      // True perspective taper often 0.45–0.85; near-parallel + short = mask
+      if (taper >= 0.45 && taper <= 0.85) sc += 25;
+      else if (taper > 0.85 && taper <= 0.98) sc += 5;
+      else if (taper >= 0.35 && taper < 0.45) sc += 10;
+      else sc -= 20;
+      if (extent >= 0.38) sc += 35;
+      else if (extent >= 0.32) sc += 10;
+      else sc -= 45; // floating mid-wedge
+      if (top >= 0.14) sc += 15;
+      else if (top < 0.1) sc -= 30;
+      if (mid >= 0.28 && mid <= 0.45) sc += 12;
+      const midTop = (c.tl.x + c.tr.x) / 2 / width;
+      const midSkew = Math.abs(midTop - mid);
+      // Huge top/bot mid skew = wrong L/R (HUD / neighbor), not true gutters
+      if (midSkew > 0.14) sc -= 60;
+      else if (midSkew > 0.1) sc -= 25;
+      if (c.tr.x / width > 0.62) sc -= 40; // TR creeping into Strike Track
+      if (isLaneMaskOverlay(c, rgba, width, height, hud.maskRight)) sc -= 120;
+      if (isNarrowMidLaneWedge(c, width, height)) sc -= 140;
+      // Near-parallel broadcast trap = not true gutters→pins
+      if (taper > 0.8 && bot < 0.42) sc -= 50;
+      return sc;
+    };
+    const accept = (det: LaneDetectResult | null, mr: number) => {
+      if (!det) return null;
+      if (cornersHitBroadcastHud(det.corners, width, height, mr)) return null;
+      if (isLaneMaskOverlay(det.corners, rgba, width, height, mr)) return null;
+      if (isNarrowMidLaneWedge(det.corners, width, height)) return null;
+      return det;
+    };
+    for (const mr of masks) {
+      const houghB = accept(
+        detectLaneCornersHough(rgba, width, height, mr, {
+          broadcastHint: true,
+        }),
+        mr
+      );
+      const cand = accept(
+        detectLaneCornersBroadcast(rgba, width, height, mr),
+        mr
+      );
+      const pool: LaneDetectResult[] = [];
+      if (houghB) pool.push({ ...houghB, broadcastHud: true });
+      if (cand) pool.push(cand);
+      if (pool.length) {
+        pool.sort((a, b) => scoreB(b.corners) - scoreB(a.corners));
+        const best = pool[0];
+        const pinY = (best.corners.tl.y + best.corners.tr.y) / 2 / height;
+        const bot = (best.corners.br.x - best.corners.bl.x) / width;
+        const top = (best.corners.tr.x - best.corners.tl.x) / width;
+        const foulY = (best.corners.bl.y + best.corners.br.y) / 2 / height;
+        const extent = foulY - pinY;
+        const tapB =
+          (best.corners.tr.x - best.corners.tl.x) /
+          Math.max(1e-3, best.corners.br.x - best.corners.bl.x);
+        const midTopB =
+          (best.corners.tl.x + best.corners.tr.x) / 2 / width;
+        const midBotB =
+          (best.corners.bl.x + best.corners.br.x) / 2 / width;
+        const skewOk = Math.abs(midTopB - midBotB) <= 0.12;
+        const trOk = best.corners.tr.x / width <= 0.62;
+        if (
+          pinY >= 0.16 &&
+          bot >= 0.2 &&
+          top >= 0.1 &&
+          extent >= 0.32 &&
+          tapB <= 0.8 &&
+          skewOk &&
+          trOk &&
+          scoreB(best.corners) > 30 &&
+          !isNarrowMidLaneWedge(best.corners, width, height)
+        ) {
+          bcast = best;
+          break;
+        }
+        if (
+          !bcast &&
+          scoreB(best.corners) > 40 &&
+          tapB <= 0.8 &&
+          skewOk &&
+          trOk &&
+          !isNarrowMidLaneWedge(best.corners, width, height)
+        )
+          bcast = best;
+      }
+    }
+    if (
+      bcast &&
+      !cornersHitBroadcastHud(bcast.corners, width, height, hud.maskRight) &&
+      !isLaneMaskOverlay(bcast.corners, rgba, width, height, hud.maskRight) &&
+      !isNarrowMidLaneWedge(bcast.corners, width, height)
+    ) {
+      return bcast;
+    }
+    const corraHud = detectLaneCornersCorra(rgba, width, height);
+    if (
+      corraHud &&
+      looksLikeBroadcastLane(corraHud.corners, width) &&
+      !cornersHitBroadcastHud(corraHud.corners, width, height, hud.maskRight) &&
+      !isLaneMaskOverlay(corraHud.corners, rgba, width, height, hud.maskRight) &&
+      !isNarrowMidLaneWedge(corraHud.corners, width, height)
+    ) {
+      return { ...corraHud, broadcastHud: true };
+    }
+    // Prefer clean reject → manual over locking broadcast lane-mask / mid-wedge
+    return null;
+  }
+
+  // Primary: Hough L/R + geometric constraints (general lanes)
+  const hough = detectLaneCornersHough(rgba, width, height, width);
+
+  // Secondary: Corra multi-row gutter pairs
   const corra = detectLaneCornersCorra(rgba, width, height);
 
   const scale = Math.min(1, 320 / width);
@@ -120,7 +1375,6 @@ export function detectLaneCorners(
   const std = Math.sqrt(Math.max(0, sumSq / gray.length - mean * mean));
   const baseThr = Math.min(210, Math.max(75, mean + Math.max(6, std * 0.28)));
 
-  // 多閾值；重罰頂中線相對底中線 skew／頂邊偏離中央（易鎖隔鄰／溝）
   let best: LaneDetectResult | null = null;
   let bestScore = -1e9;
   for (const dThr of [0, -10, 12, -18, 22, -6, 8]) {
@@ -142,11 +1396,28 @@ export function detectLaneCorners(
     }
   }
 
-  // 最終一律 snap：multi-seek／閾值差唔會再令 mid／bot 漂（live×5）
-  const src = best ?? (corra
-    ? { ...corra, corners: corra.corners }
-    : null);
-  if (!src) return null;
+  // Rank Hough / Corra / bright-band; prefer geometry that looks like true gutters
+  type Cand = { det: LaneDetectResult; score: number };
+  const pool: Cand[] = [];
+  if (hough) {
+    pool.push({
+      det: hough,
+      score: scoreLaneGeometry(hough, width, height) + 18, // prefer Hough primary
+    });
+  }
+  if (corra) {
+    pool.push({
+      det: corra,
+      score: scoreLaneGeometry(corra, width, height) + 8,
+    });
+  }
+  if (best) {
+    pool.push({ det: best, score: bestScore });
+  }
+  if (!pool.length) return null;
+  pool.sort((a, b) => b.score - a.score);
+  const src = pool[0].det;
+
   return {
     ...src,
     corners: snapCornersToTrueGutter(
@@ -156,8 +1427,10 @@ export function detectLaneCorners(
       gray,
       sw,
       sh,
-      scale
+      scale,
+      rgba
     ),
+    message: src.message || "已估四角（Hough／幾何）；失敗請手動拖曳",
   };
 }
 
@@ -177,11 +1450,17 @@ export function scoreLaneGeometry(
   const skewSigned = (midTop - midBot) / width; // >0 頂右偏
   const skewAbs = Math.abs(skewSigned);
   const pinBand =
-    pinY >= height * 0.08 && pinY <= height * 0.17
-      ? 1
-      : pinY < height * 0.08
-        ? 0.15
-        : 0.55;
+    pinY >= height * 0.092 && pinY <= height * 0.102
+      ? 1.15 // demo pin heads (r4: below AMF dark, above necks)
+      : pinY >= height * 0.055 && pinY < height * 0.092
+        ? 0.35 // AMF / masking dark band — weak
+        : pinY > height * 0.102 && pinY <= height * 0.14
+          ? 0.7 // necks / deck floor — weaker
+          : pinY >= height * 0.16 && pinY <= height * 0.3
+            ? 0.95 // broadcast pin deck
+            : pinY < height * 0.05
+              ? 0.15
+              : 0.4;
   const topW = c.tr.x - c.tl.x;
   const botW = c.br.x - c.bl.x;
   const trap =
@@ -191,14 +1470,15 @@ export function scoreLaneGeometry(
   const absSkewPen = skewAbs > 0.08 ? (skewAbs - 0.08) * 80 : 0;
   // 單道寬：底寬吞鄰道／人影時常見 >52% 畫面
   const botFrac = botW / Math.max(1, width);
-  // 0.48–0.54 貼真溝唔罰；>0.55 先重罰
+  // 真溝 foul≈0.50–0.58 唔罰；過窄（亮帶）或過寬罰
+  // True gutters often botFrac 0.50–0.64; only penalize inset bright-band or two-lane
   const wideBotPen =
-    botFrac > 0.55
-      ? (botFrac - 0.55) * 200
-      : botFrac > 0.54
-        ? (botFrac - 0.54) * 40
-        : botFrac < 0.36
-          ? (0.36 - botFrac) * 30
+    botFrac > 0.68
+      ? (botFrac - 0.68) * 200
+      : botFrac > 0.64
+        ? (botFrac - 0.64) * 40
+        : botFrac < 0.48
+          ? (0.48 - botFrac) * 55
           : 0;
   const taper = topW / Math.max(1, botW);
   // 後方視角合理頂/底約 0.18–0.40；太扁＝鎖多道，太尖＝假夾
@@ -211,14 +1491,20 @@ export function scoreLaneGeometry(
     centerDist > 0.12
       ? (centerDist - 0.06) * 160
       : Math.max(0, centerDist - 0.08) * 50;
-  // 底中線落喺右半：後方視角單道常略左；右偏多半係鄰道／人影木面
+  // 真溝 midF≈0.47–0.50；極端左右先罰
   const midBotFrac = midBot / Math.max(1, width);
   const rightLanePen =
     midBotFrac > 0.54
-      ? (midBotFrac - 0.5) * 120
-      : midBotFrac > 0.51
-        ? (midBotFrac - 0.5) * 60
+      ? (midBotFrac - 0.5) * 100
+      : midBotFrac < 0.42
+        ? (0.47 - midBotFrac) * 80
         : 0;
+  // 右欄 HUD：只喺極端右緣重罰（demo BR≈0.76 唔罰）
+  const hudPen = cornersHitBroadcastHud(c, width, height)
+    ? 80
+    : c.br.x / width > 0.86
+      ? 35
+      : 0;
   return (
     cand.confidence * 100 +
     pinBand * 22 +
@@ -229,7 +1515,8 @@ export function scoreLaneGeometry(
     wideBotPen -
     taperPen -
     edgePen -
-    rightLanePen
+    rightLanePen -
+    hudPen
   );
 }
 
@@ -647,38 +1934,8 @@ function detectLaneCornersWithThr(
     }
   }
 
-  // Phase A+B：保留擬合中線（略左 OK）；只改寬度
-  // 診斷：mid≈449 + botFrac 0.50–0.54 + topFrac≈0.16 + pinsY≈0.11 → arr≈14
-  {
-    botW = br.x - bl.x;
-    topW = tr.x - tl.x;
-    let trajMid = (bl.x + br.x) / 2;
-    const midTop = (tl.x + tr.x) / 2;
-    if (trajMid / sw > 0.52) {
-      trajMid = trajMid * 0.55 + sw * 0.45 * 0.45;
-    } else if (midTop - trajMid > sw * 0.05) {
-      trajMid = trajMid * 0.7 + midTop * 0.3;
-    }
-    // mid 0.428 ≈ 甜點；溝跟蹤另處理
-    {
-      const lock = sw * 0.428;
-      trajMid = lock;
-    }
-
-    // 固定 bot≈0.52；foul 底由擬合 y 保留（snap 再抬到 ≥0.84）
-    {
-      const leftHalf = sw * 0.255;
-      const rightHalf = sw * 0.265;
-      bl = { ...bl, x: trajMid - leftHalf };
-      br = { ...br, x: trajMid + rightHalf };
-      botW = br.x - bl.x;
-    }
-    const pinTarget = clamp(sh * 0.11, sh * 0.09, sh * 0.125);
-    const topHalf = sw * 0.08;
-    tl = { x: trajMid - topHalf, y: pinTarget };
-    tr = { x: trajMid + topHalf, y: pinTarget };
-    topW = tr.x - tl.x;
-  }
+  // Phase A+B removed: no green/red paint hard-lock (208/802).
+  // Final corners come from edge fit above; outer snap uses Hough/geometry.
 
   const inv = 1 / scale;
   const corners: LaneCorners = {
@@ -715,9 +1972,9 @@ function detectLaneCornersWithThr(
   }
   if (finalRatio < 0.15 || finalRatio > 0.85) confidence -= 0.1;
   if (finalBot < width * 0.25) confidence -= 0.08;
-  // 0.48–0.54＝貼真溝（診斷可保 arr 13–15）；>0.55 先當鄰道風險
-  if (finalBot > width * 0.55) confidence -= 0.14;
-  else if (finalBot > width * 0.54) confidence -= 0.04;
+  // 真溝 foul≈0.50–0.58
+  if (finalBot > width * 0.62) confidence -= 0.14;
+  else if (finalBot < width * 0.45) confidence -= 0.08;
   {
     const taper = finalTop / Math.max(1, finalBot);
     if (taper < 0.16) confidence -= 0.1;
@@ -798,54 +2055,142 @@ function gutterFlankScore(
 
 
 /**
- * foul 列真溝：內亮外暗 + 強 |gx|；回傳工作座標 l/r。
- * 診斷：bowling-demo foul≈0.56，軌跡安全上限再用 0.54。
+ * 單道 foul 溝對：expectW≈0.42，seed mid≈0.55（lane15）。
+ * 拒絕 bot>0.50（舊 bug：14 左溝～15 右溝兩道寬）。
  */
-function measureFoulGutterPair(
+/**
+ * 由 foul 向上跟蹤單道溝，擬合 L/R 直線（外推到 pins）。
+ * seed mid≈0.55；只收 bot∈[0.34,0.50] 嘅列，避兩道寬。
+ */
+function fitSingleLaneGutters(
+  gray: Uint8ClampedArray,
+  sw: number,
+  sh: number,
+  seedMid: number
+): { la: number; lb: number; ra: number; rb: number; n: number } | null {
+  const pts: { y: number; l: number; r: number }[] = [];
+  let mid = seedMid;
+  let expectW = sw * 0.55;
+  for (let yf = 0.88; yf >= 0.36; yf -= 0.02) {
+    const y = Math.round(yf * sh);
+    const targetW = sw * clamp(0.22 + yf * 0.40, 0.24, 0.58);
+    expectW = expectW * 0.45 + targetW * 0.55;
+    const pair = measureLaneGutterPair(
+      gray,
+      sw,
+      y,
+      mid,
+      expectW * 0.75,
+      expectW * 1.25
+    );
+    if (!pair) continue;
+    const w = pair.r - pair.l;
+    const m = (pair.l + pair.r) / 2;
+    if (Math.abs(m - mid) > sw * 0.08) continue;
+    if (w < sw * 0.48 || w > sw * 0.66) continue;
+    pts.push({ y, l: pair.l, r: pair.r });
+    mid = mid * 0.4 + m * 0.6;
+    expectW = expectW * 0.5 + w * 0.5;
+  }
+  if (pts.length < 8) return null;
+  const fit = (ys: number[], xs: number[]) => {
+    const n = ys.length;
+    let sy = 0,
+      sx = 0,
+      syy = 0,
+      sxy = 0;
+    for (let i = 0; i < n; i++) {
+      sy += ys[i];
+      sx += xs[i];
+      syy += ys[i] * ys[i];
+      sxy += ys[i] * xs[i];
+    }
+    const den = n * syy - sy * sy;
+    if (Math.abs(den) < 1e-6) return null;
+    const b = (n * sxy - sy * sx) / den;
+    const a = (sx - b * sy) / n;
+    return { a, b };
+  };
+  const ys = pts.map((p) => p.y);
+  const ls = pts.map((p) => p.l);
+  const rs = pts.map((p) => p.r);
+  // robust: drop large residuals once
+  const robust = (xs: number[]) => {
+    const first = fit(ys, xs);
+    if (!first) return null;
+    const res = ys.map((y, i) => Math.abs(xs[i] - (first.a + first.b * y)));
+    const sorted = [...res].sort((a, b) => a - b);
+    const med = sorted[Math.floor(sorted.length / 2)] || 1;
+    const thr = Math.max(3, med * 2.2);
+    const iy: number[] = [];
+    const ix: number[] = [];
+    for (let i = 0; i < ys.length; i++) {
+      if (res[i] <= thr) {
+        iy.push(ys[i]);
+        ix.push(xs[i]);
+      }
+    }
+    if (iy.length < 6) return first;
+    return fit(iy, ix) ?? first;
+  };
+  const lf = robust(ls);
+  const rf = robust(rs);
+  if (!lf || !rf) return null;
+  return { la: lf.a, lb: lf.b, ra: rf.a, rb: rf.b, n: pts.length };
+}
+
+function measureLaneGutterPair(
   gray: Uint8ClampedArray,
   sw: number,
   y: number,
-  mid: number
+  mid: number,
+  minW: number,
+  maxW: number
 ): { l: number; r: number } | null {
   if (y < 2 || y >= gray.length / sw - 2) return null;
   const row = y * sw;
-  const thrG = 18;
-  let bestL = { x: Math.floor(mid - sw * 0.2), sc: -1e9 };
-  let bestR = { x: Math.ceil(mid + sw * 0.2), sc: -1e9 };
-  const xL0 = Math.max(2, Math.floor(mid - sw * 0.35));
-  const xL1 = Math.floor(mid - sw * 0.12);
-  for (let x = xL0; x <= xL1; x++) {
-    const g = Math.abs(gray[row + x + 1] - gray[row + x - 1]);
-    if (g < thrG) continue;
+  const thrG = 14;
+  const expectW = (minW + maxW) / 2;
+  let best: { l: number; r: number; sc: number } | null = null;
+  const xL0 = Math.max(2, Math.floor(mid - maxW * 0.7));
+  const xL1 = Math.floor(mid - expectW * 0.25);
+  const xR0 = Math.ceil(mid + expectW * 0.25);
+  const xR1 = Math.min(sw - 3, Math.ceil(mid + maxW * 0.7));
+  for (let l = xL0; l <= xL1; l++) {
+    const gL = Math.abs(gray[row + l + 1] - gray[row + l - 1]);
+    if (gL < thrG) continue;
     let inM = 0, outM = 0, nI = 0, nO = 0;
-    for (let k = 1; k <= 10; k++) {
-      if (x + k < sw) { inM += gray[row + x + k]; nI++; }
-      if (x - k >= 0) { outM += gray[row + x - k]; nO++; }
+    for (let k = 1; k <= 12; k++) {
+      if (l + k < sw) { inM += gray[row + l + k]; nI++; }
+      if (l - k >= 0) { outM += gray[row + l - k]; nO++; }
     }
-    const flank = nI && nO ? (inM / nI - outM / nO) / 40 : 0;
-    if (flank < 0.2) continue;
-    const sc = g * 0.08 + flank * 30;
-    if (sc > bestL.sc) bestL = { x, sc };
-  }
-  const xR0 = Math.ceil(mid + sw * 0.12);
-  const xR1 = Math.min(sw - 3, Math.ceil(mid + sw * 0.35));
-  for (let x = xR0; x <= xR1; x++) {
-    const g = Math.abs(gray[row + x + 1] - gray[row + x - 1]);
-    if (g < thrG) continue;
-    let inM = 0, outM = 0, nI = 0, nO = 0;
-    for (let k = 1; k <= 10; k++) {
-      if (x - k >= 0) { inM += gray[row + x - k]; nI++; }
-      if (x + k < sw) { outM += gray[row + x + k]; nO++; }
+    const fL = nI && nO ? (inM / nI - outM / nO) / 40 : 0;
+    if (fL < 0.12) continue;
+    for (let r = xR0; r <= xR1; r++) {
+      const w = r - l;
+      if (w < minW || w > maxW) continue;
+      const gR = Math.abs(gray[row + r + 1] - gray[row + r - 1]);
+      if (gR < thrG) continue;
+      let inR = 0, outR = 0, nIR = 0, nOR = 0;
+      for (let k = 1; k <= 12; k++) {
+        if (r - k >= 0) { inR += gray[row + r - k]; nIR++; }
+        if (r + k < sw) { outR += gray[row + r + k]; nOR++; }
+      }
+      const fR = nIR && nOR ? (inR / nIR - outR / nOR) / 40 : 0;
+      if (fR < 0.12) continue;
+      const pairMid = (l + r) / 2;
+      // Prefer outer (wider) gutter pair within band — avoid inset oil lines
+      const sc =
+        (gL + gR) * 0.08 +
+        (fL + fR) * 26 -
+        Math.abs(pairMid - mid) * 4 -
+        (Math.abs(w - expectW) / sw) * 25 +
+        (w / sw) * 35;
+      if (!best || sc > best.sc) best = { l, r, sc };
     }
-    const flank = nI && nO ? (inM / nI - outM / nO) / 40 : 0;
-    if (flank < 0.2) continue;
-    const sc = g * 0.08 + flank * 30;
-    if (sc > bestR.sc) bestR = { x, sc };
   }
-  const w = bestR.x - bestL.x;
-  if (w < sw * 0.42 || w > sw * 0.62) return null;
-  if (bestL.sc < 0 || bestR.sc < 0) return null;
-  return { l: bestL.x, r: bestR.x };
+  if (!best || best.sc < 0) return null;
+  return { l: best.l, r: best.r };
 }
 
 /**

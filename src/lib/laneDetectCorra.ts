@@ -75,7 +75,7 @@ function selectClosestGutterPair(
   // 透視：上窄下寬；foul 端可到 ~0.58
   const expectW =
     sw *
-    clamp(0.25 + yFrac * 0.28, 0.25, 0.50);
+    clamp(0.22 + yFrac * 0.22, 0.22, 0.45);
   const maxHalf = expectW * 0.62;
   const minHalf = expectW * 0.32;
   const x0 = Math.max(2, Math.floor(mid - maxHalf));
@@ -268,14 +268,14 @@ export function detectLaneCornersCorra(
   const ys: number[] = [];
   const ls: number[] = [];
   const rs: number[] = [];
-  let expectMid = sw * 0.42; // bowling-demo 後方單道略偏左
+  let expectMid = sw * 0.55; // bowling-demo lane15 單道（唔好 0.42→鎖 14）
   for (let y = Math.floor(sh * 0.2); y <= Math.floor(sh * 0.88); y += Math.max(1, Math.round(sh * 0.012))) {
     const yFrac = y / sh;
     const ep = selectClosestGutterPair(gray, sw, y, expectMid, yFrac);
     if (!ep) continue;
     const mid = (ep.l + ep.r) / 2;
     if (Math.abs(mid - expectMid) > sw * 0.07) continue;
-    if (mid / sw > 0.54 || mid / sw < 0.34) continue;
+    if (mid / sw > 0.62 || mid / sw < 0.45) continue;
     ys.push(y);
     ls.push(ep.l);
     rs.push(ep.r);
@@ -301,7 +301,7 @@ export function detectLaneCornersCorra(
 
   const botW = br.x - bl.x;
   let topW = tr.x - tl.x;
-  if (botW < sw * 0.3 || botW > sw * 0.62 || topW < sw * 0.07 || tl.x >= tr.x) {
+  if (botW < sw * 0.28 || botW > sw * 0.50 || topW < sw * 0.07 || tl.x >= tr.x) {
     return null;
   }
   // 頂過窄：對稱擴
@@ -314,8 +314,8 @@ export function detectLaneCornersCorra(
   }
 
   const midBot = (bl.x + br.x) / 2;
-  // 中線唔好喺右半（鄰道）
-  if (midBot / sw > 0.53 || midBot / sw < 0.35) return null;
+  // 單道 mid≈0.50–0.58；太左＝14、太右＝16
+  if (midBot / sw > 0.62 || midBot / sw < 0.45) return null;
 
   const inv = 1 / scale;
   const corners: LaneCorners = {

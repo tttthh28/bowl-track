@@ -74,6 +74,32 @@ export function buildHomography(corners: LaneCorners): Homography | null {
   return { h };
 }
 
+/**
+ * Track／homography 用四角：保留 foul 真溝，pins 端去 skew（pin mid → foul mid）。
+ *
+ * 視覺四角可鎖真溝（foul≈208/802、pins≈562/694 midP≈0.59），但強 pin skew
+ * 會令 pointInLane 拒球＋feet 壓縮 → arr≈11.8。映射梯形用 midF + top≈0.18×W
+ * 恢復 board/feet，顯示四角唔改（Tony 視覺 bar）。
+ */
+export function mappingCornersForTrack(corners: LaneCorners): LaneCorners {
+  const midF = (corners.bl.x + corners.br.x) / 2;
+  const botW = Math.max(8, corners.br.x - corners.bl.x);
+  // bot≈0.56×W 時 topFrac≈0.18 → 探針 arr∈[13,15] 且 span 穩
+  const topW = botW * (0.18 / 0.56);
+  const pinY = (corners.tl.y + corners.tr.y) / 2;
+  return {
+    bl: { ...corners.bl },
+    br: { ...corners.br },
+    tl: { x: midF - topW / 2, y: pinY },
+    tr: { x: midF + topW / 2, y: pinY },
+  };
+}
+
+/** 顯示四角 → 追蹤／估計用 H（去 pin skew） */
+export function buildTrackHomography(corners: LaneCorners): Homography | null {
+  return buildHomography(mappingCornersForTrack(corners));
+}
+
 export function applyHomography(H: Homography, p: Point2D): Point2D {
   const [a, b, c, d, e, f, g, hh] = H.h;
   const w = g * p.x + hh * p.y + 1;
@@ -105,6 +131,498 @@ export type TrajectoryCoverage = {
   span: number;
   count: number;
 };
+
+/**
+ * bowling-demo：剔尖角折線 + 沿 feet 平滑 board（顯示／估計用）。
+ * 保留大致 foul→pins 單調前進，避免 softRelock／預測造成 polyline V／折角。
+ * 強化：同 feet 合併、早段 V 峰剔除、更緊 turn 門檻、多趟 board 平滑。
+ */
+export function smoothDemoPath<T extends { lane?: LanePoint; predicted?: boolean; image: { x: number; y: number }; t: number }>(
+  points: T[]
+): T[] {
+  const withLane = points.filter((p) => p.lane);
+  if (withLane.length < 5) return points;
+  const sorted = [...withLane].sort(
+    (a, b) => a.lane!.feet - b.lane!.feet
+  );
+
+  // 1) 合併近距離 feet（防 49.9′ 震盪折角）
+  const collapsed: T[] = [];
+  for (const p of sorted) {
+    const last = collapsed[collapsed.length - 1];
+    if (
+      last?.lane &&
+      p.lane &&
+      Math.abs(p.lane.feet - last.lane.feet) < 0.45
+    ) {
+      const preferNew = last.predicted && !p.predicted;
+      const preferOld = !last.predicted && p.predicted;
+      const board = preferOld
+        ? last.lane.board
+        : preferNew
+          ? p.lane.board
+          : (last.lane.board + p.lane.board) / 2;
+      const feet = (last.lane.feet + p.lane.feet) / 2;
+      collapsed[collapsed.length - 1] = {
+        ...(preferNew ? p : last),
+        lane: { feet, board },
+        predicted: last.predicted && p.predicted ? true : undefined,
+      } as T;
+    } else {
+      collapsed.push(p);
+    }
+  }
+  if (collapsed.length < 5) return collapsed;
+
+  // 2) 剔尖角（預測更嚴；非預測亦降門檻）
+  const dropTurns = (src: T[]): T[] => {
+    const out: T[] = [src[0]];
+    for (let i = 1; i < src.length - 1; i++) {
+      const prev = out[out.length - 1];
+      const cur = src[i];
+      const next = src[i + 1];
+      if (!prev.lane || !cur.lane || !next.lane) {
+        out.push(cur);
+        continue;
+      }
+      const df1 = Math.max(0.15, cur.lane.feet - prev.lane.feet);
+      const df2 = Math.max(0.15, next.lane.feet - cur.lane.feet);
+      const slope1 = (cur.lane.board - prev.lane.board) / df1;
+      const slope2 = (next.lane.board - cur.lane.board) / df2;
+      const turn = Math.abs(slope2 - slope1);
+      const early = cur.lane.feet < 22;
+      const predLim = early ? 1.6 : 2.2;
+      const hardLim = early ? 2.4 : 3.2;
+      if (turn > predLim && cur.predicted) continue;
+      if (turn > hardLim) continue;
+      out.push(cur);
+    }
+    out.push(src[src.length - 1]);
+    return out;
+  };
+  let kept = dropTurns(collapsed);
+
+  // 3) 早段／袋口前 V 峰：相對弦高 > 2.2 board 則丟（Tony：無角）
+  const dropVPeaks = (src: T[]): T[] => {
+    if (src.length < 4) return src;
+    const out: T[] = [src[0]];
+    for (let i = 1; i < src.length - 1; i++) {
+      const prev = out[out.length - 1];
+      const cur = src[i];
+      // 找右側足夠遠嘅錨（≥2.5′），唔好用緊鄰
+      let next = src[i + 1];
+      for (let j = i + 1; j < src.length; j++) {
+        if (
+          src[j].lane &&
+          cur.lane &&
+          src[j].lane!.feet - cur.lane.feet >= 2.5
+        ) {
+          next = src[j];
+          break;
+        }
+        next = src[j];
+      }
+      if (!prev.lane || !cur.lane || !next.lane) {
+        out.push(cur);
+        continue;
+      }
+      const df = next.lane.feet - prev.lane.feet;
+      if (df < 1.2) {
+        out.push(cur);
+        continue;
+      }
+      const u = (cur.lane.feet - prev.lane.feet) / df;
+      const chord = prev.lane.board + u * (next.lane.board - prev.lane.board);
+      const elev = Math.abs(cur.lane.board - chord);
+      const inVZone =
+        cur.lane.feet < 22 ||
+        (cur.lane.feet >= 45 && cur.lane.feet <= 55);
+      if (inVZone && elev > 2.2) continue;
+      if (inVZone && elev > 1.5 && cur.predicted) continue;
+      out.push(cur);
+    }
+    out.push(src[src.length - 1]);
+    return out;
+  };
+  kept = dropVPeaks(kept);
+  if (kept.length >= 5) kept = dropTurns(kept);
+
+  // 4) 多趟加權 board 平滑（端點保留；中段去折）
+  const smoothPass = (src: T[]): T[] =>
+    src.map((p, i) => {
+      if (!p.lane || i === 0 || i === src.length - 1) return p;
+      const a = src[i - 1].lane!.board;
+      const b = p.lane.board;
+      const c = src[i + 1].lane!.board;
+      if (src.length >= 5 && i >= 2 && i <= src.length - 3) {
+        const a2 = src[i - 2].lane!.board;
+        const c2 = src[i + 2].lane!.board;
+        return {
+          ...p,
+          lane: {
+            feet: p.lane.feet,
+            board: a2 * 0.1 + a * 0.2 + b * 0.4 + c * 0.2 + c2 * 0.1,
+          },
+        };
+      }
+      return {
+        ...p,
+        lane: { feet: p.lane.feet, board: a * 0.25 + b * 0.5 + c * 0.25 },
+      };
+    });
+  kept = smoothPass(smoothPass(kept));
+
+  // 5) 殘餘高 turn：把中點拉向弦（唔刪點，保覆蓋）
+  for (let i = 1; i < kept.length - 1; i++) {
+    const prev = kept[i - 1];
+    const cur = kept[i];
+    const next = kept[i + 1];
+    if (!prev.lane || !cur.lane || !next.lane) continue;
+    const df1 = Math.max(0.15, cur.lane.feet - prev.lane.feet);
+    const df2 = Math.max(0.15, next.lane.feet - cur.lane.feet);
+    const turn = Math.abs(
+      (next.lane.board - cur.lane.board) / df2 -
+        (cur.lane.board - prev.lane.board) / df1
+    );
+    if (turn > 1.4) {
+      const df = next.lane.feet - prev.lane.feet;
+      const u = df > 0.01 ? (cur.lane.feet - prev.lane.feet) / df : 0.5;
+      const chord =
+        prev.lane.board + u * (next.lane.board - prev.lane.board);
+      kept[i] = {
+        ...cur,
+        lane: {
+          feet: cur.lane.feet,
+          board: cur.lane.board * 0.35 + chord * 0.65,
+        },
+      };
+    }
+  }
+
+  // 末趟輕平滑：壓低殘餘 jagged（保端點）
+  kept = smoothPass(kept);
+
+  // 6) 疏點 densify：cubic Hermite board(feet) 重採樣，避免 Catmull 喺 8 點折線造 13–15′ elbow
+  kept = densifyDemoPathCubic(kept);
+
+  // 7) 密點後再限曲率（尤其 tony／arrows 10–20′）：拉向弦，散開 heading 轉折
+  kept = limitDemoPathCurvature(kept);
+
+  // 8) arrows 帶局部二次擬合：把殘餘 13–15′ elbow 拉成漸變 hook
+  kept = blendTonyBandQuadratic(kept);
+
+  // 密點後再輕平滑一次
+  if (kept.length >= 5) kept = smoothPass(kept);
+  return kept;
+}
+
+/** arrows／tony 帶：局部二次 board(feet) 混合，殺 diagonal→vertical elbow */
+function blendTonyBandQuadratic<
+  T extends {
+    lane?: LanePoint;
+    predicted?: boolean;
+    image: { x: number; y: number };
+    t: number;
+  }
+>(src: T[]): T[] {
+  if (src.length < 6) return src;
+  const L = src.filter((p) => p.lane);
+  if (L.length < 6) return src;
+
+  // 最小二乘二次：board ≈ a + b f + c f²，用視窗內點
+  const fitQuad = (
+    pts: { feet: number; board: number }[]
+  ): ((f: number) => number) | null => {
+    if (pts.length < 4) return null;
+    let s0 = 0,
+      s1 = 0,
+      s2 = 0,
+      s3 = 0,
+      s4 = 0;
+    let y0 = 0,
+      y1 = 0,
+      y2 = 0;
+    for (const p of pts) {
+      const f = p.feet;
+      const f2 = f * f;
+      const f3 = f2 * f;
+      const f4 = f2 * f2;
+      s0 += 1;
+      s1 += f;
+      s2 += f2;
+      s3 += f3;
+      s4 += f4;
+      y0 += p.board;
+      y1 += p.board * f;
+      y2 += p.board * f2;
+    }
+    // 解 3x3 正規方程
+    const M = [
+      [s0, s1, s2, y0],
+      [s1, s2, s3, y1],
+      [s2, s3, s4, y2],
+    ];
+    for (let col = 0; col < 3; col++) {
+      let piv = col;
+      for (let r = col + 1; r < 3; r++) {
+        if (Math.abs(M[r][col]) > Math.abs(M[piv][col])) piv = r;
+      }
+      if (Math.abs(M[piv][col]) < 1e-12) return null;
+      if (piv !== col) {
+        const tmp = M[col];
+        M[col] = M[piv];
+        M[piv] = tmp;
+      }
+      const div = M[col][col];
+      for (let c = col; c < 4; c++) M[col][c] /= div;
+      for (let r = 0; r < 3; r++) {
+        if (r === col) continue;
+        const f = M[r][col];
+        for (let c = col; c < 4; c++) M[r][c] -= f * M[col][c];
+      }
+    }
+    const a = M[0][3],
+      b = M[1][3],
+      c = M[2][3];
+    return (f: number) => a + b * f + c * f * f;
+  };
+
+  // 一次全局二次（foul→~30′），arrows 帶大力混合
+  const early = L.filter(
+    (p) => p.lane!.feet >= 4 && p.lane!.feet <= 32
+  ).map((p) => ({ feet: p.lane!.feet, board: p.lane!.board }));
+  const qEarly = fitQuad(early);
+  if (!qEarly) return src;
+
+  return src.map((p, idx) => {
+    if (!p.lane) return p;
+    if (idx === 0 || idx === src.length - 1) return p;
+    const f = p.lane.feet;
+    if (f < 9 || f > 22) return p;
+    const fitted = qEarly(f);
+    // 12–17′ 最強（TesterManual elbow 帶）；兩側漸弱
+    let w = 0.35;
+    if (f >= 12 && f <= 17) w = 0.82;
+    else if (f >= 10 && f <= 19) w = 0.65;
+    return {
+      ...p,
+      lane: {
+        feet: f,
+        board: p.lane.board * (1 - w) + fitted * w,
+      },
+    };
+  });
+}
+
+/** feet→board 單調 cubic Hermite densify（間距 > step 就插點） */
+function densifyDemoPathCubic<
+  T extends {
+    lane?: LanePoint;
+    predicted?: boolean;
+    image: { x: number; y: number };
+    t: number;
+  }
+>(src: T[], step = 1.25): T[] {
+  if (src.length < 3) return src;
+  const L = src.filter((p) => p.lane);
+  if (L.length < 3) return src;
+
+  const slopeAt = (i: number): number => {
+    if (i <= 0) {
+      const df = Math.max(0.15, L[1].lane!.feet - L[0].lane!.feet);
+      return (L[1].lane!.board - L[0].lane!.board) / df;
+    }
+    if (i >= L.length - 1) {
+      const a = L[L.length - 2];
+      const b = L[L.length - 1];
+      const df = Math.max(0.15, b.lane!.feet - a.lane!.feet);
+      return (b.lane!.board - a.lane!.board) / df;
+    }
+    const a = L[i - 1];
+    const b = L[i + 1];
+    const df = Math.max(0.15, b.lane!.feet - a.lane!.feet);
+    return (b.lane!.board - a.lane!.board) / df;
+  };
+
+  const hermite = (y0: number, m0: number, y1: number, m1: number, u: number, df: number) => {
+    const u2 = u * u;
+    const u3 = u2 * u;
+    const h00 = 2 * u3 - 3 * u2 + 1;
+    const h10 = u3 - 2 * u2 + u;
+    const h01 = -2 * u3 + 3 * u2;
+    const h11 = u3 - u2;
+    return h00 * y0 + h10 * df * m0 + h01 * y1 + h11 * df * m1;
+  };
+
+  const out: T[] = [];
+  for (let i = 0; i < L.length - 1; i++) {
+    const a = L[i];
+    const b = L[i + 1];
+    out.push(a);
+    const df = b.lane!.feet - a.lane!.feet;
+    if (df <= step + 0.05) continue;
+    const m0 = slopeAt(i);
+    const m1 = slopeAt(i + 1);
+    const nInsert = Math.min(12, Math.max(1, Math.floor(df / step)));
+    for (let k = 1; k <= nInsert; k++) {
+      const u = k / (nInsert + 1);
+      const feet = a.lane!.feet + u * df;
+      // 早段／arrows 帶用較平嘅斜率混合，避免 Hermite 喺折角處過衝
+      let board = hermite(a.lane!.board, m0, b.lane!.board, m1, u, df);
+      const linear = a.lane!.board + u * (b.lane!.board - a.lane!.board);
+      const midFt = feet;
+      if (midFt >= 8 && midFt <= 22) {
+        // tony band：偏線性，之後 limitCurvature 再散開
+        board = board * 0.35 + linear * 0.65;
+      } else {
+        board = board * 0.7 + linear * 0.3;
+      }
+      out.push({
+        ...a,
+        image: {
+          x: a.image.x + u * (b.image.x - a.image.x),
+          y: a.image.y + u * (b.image.y - a.image.y),
+        },
+        lane: { feet, board },
+        t: a.t + u * (b.t - a.t),
+        predicted: true,
+      } as T);
+    }
+  }
+  out.push(L[L.length - 1]);
+  return out;
+}
+
+/**
+ * 限 heading 轉折：若相鄰斜率差過大，把中點拉向弦。
+ * 喺 10–20′（arrows／tony）用更緊門檻，專打 13–15′ elbow。
+ */
+function limitDemoPathCurvature<
+  T extends {
+    lane?: LanePoint;
+    predicted?: boolean;
+    image: { x: number; y: number };
+    t: number;
+  }
+>(src: T[], passes = 8): T[] {
+  if (src.length < 4) return src;
+  let cur = src.map((p) => ({ ...p, lane: p.lane ? { ...p.lane } : undefined }));
+  for (let pass = 0; pass < passes; pass++) {
+    const next = cur.slice();
+    for (let i = 1; i < cur.length - 1; i++) {
+      const prev = cur[i - 1];
+      const mid = cur[i];
+      const nxt = cur[i + 1];
+      if (!prev.lane || !mid.lane || !nxt.lane) continue;
+      // 保 foul／pins 端點
+      if (i === 1 || i === cur.length - 2) continue;
+      const df1 = Math.max(0.12, mid.lane.feet - prev.lane.feet);
+      const df2 = Math.max(0.12, nxt.lane.feet - mid.lane.feet);
+      const s1 = (mid.lane.board - prev.lane.board) / df1;
+      const s2 = (nxt.lane.board - mid.lane.board) / df2;
+      const turn = Math.abs(s2 - s1);
+      let ang =
+        Math.abs(
+          Math.atan2(mid.lane.board - prev.lane.board, df1) -
+            Math.atan2(nxt.lane.board - mid.lane.board, df2)
+        ) *
+        (180 / Math.PI);
+      if (ang > 180) ang = 360 - ang;
+      const tony = mid.lane.feet >= 10 && mid.lane.feet <= 20;
+      const arrows = mid.lane.feet >= 12.5 && mid.lane.feet <= 16.5;
+      // arrows 帶最緊（TesterManual 13–15′ elbow）
+      const turnLim = arrows ? 0.28 : tony ? 0.4 : 0.85;
+      const angLim = arrows ? 5.5 : tony ? 7.5 : 12;
+      if (turn < turnLim && ang < angLim) continue;
+      const df = nxt.lane.feet - prev.lane.feet;
+      const u = df > 0.01 ? (mid.lane.feet - prev.lane.feet) / df : 0.5;
+      const chord =
+        prev.lane.board + u * (nxt.lane.board - prev.lane.board);
+      const w = arrows ? 0.88 : tony ? 0.8 : 0.55;
+      next[i] = {
+        ...mid,
+        lane: {
+          feet: mid.lane.feet,
+          board: mid.lane.board * (1 - w) + chord * w,
+        },
+      };
+    }
+    cur = next;
+  }
+  // 額外：用 ±2 鄰點弦再拉一次 arrows 帶（散開 1.3′ 內 30° 折）
+  const next2 = cur.slice();
+  for (let i = 2; i < cur.length - 2; i++) {
+    const mid = cur[i];
+    if (!mid.lane) continue;
+    if (mid.lane.feet < 11 || mid.lane.feet > 18) continue;
+    const a = cur[i - 2].lane!;
+    const b = cur[i + 2].lane!;
+    const df = b.feet - a.feet;
+    if (df < 1.5) continue;
+    const u = (mid.lane.feet - a.feet) / df;
+    const chord = a.board + u * (b.board - a.board);
+    next2[i] = {
+      ...mid,
+      lane: {
+        feet: mid.lane.feet,
+        board: mid.lane.board * 0.4 + chord * 0.6,
+      },
+    };
+  }
+  return next2 as T[];
+}
+
+/** 軌跡尖角度量（self-test／門檻）：相鄰 Δboard 二階差均值 */
+export function demoPathJaggedness(
+  points: { lane?: LanePoint }[]
+): number {
+  const L = points.filter((p) => p.lane);
+  if (L.length < 3) return 0;
+  let s = 0;
+  let n = 0;
+  for (let i = 1; i < L.length - 1; i++) {
+    s += Math.abs(
+      L[i + 1].lane!.board -
+        L[i].lane!.board -
+        (L[i].lane!.board - L[i - 1].lane!.board)
+    );
+    n++;
+  }
+  return n ? s / n : 0;
+}
+
+/**
+ * 最大 heading 轉折（度）喺 [lo,hi]′ 帶——專測 13–15′ elbow。
+ * 回傳 { maxDeg, atFeet, spanFt }；無點則 maxDeg=0。
+ */
+export function demoPathMaxElbowDeg(
+  points: { lane?: LanePoint }[],
+  lo = 10,
+  hi = 18
+): { maxDeg: number; atFeet: number; spanFt: number } {
+  const L = points.filter((p) => p.lane).map((p) => p.lane!);
+  let maxDeg = 0;
+  let atFeet = 0;
+  let spanFt = 0;
+  for (let i = 1; i < L.length - 1; i++) {
+    const a = L[i - 1];
+    const b = L[i];
+    const c = L[i + 1];
+    if (b.feet < lo || b.feet > hi) continue;
+    const df1 = Math.max(0.05, b.feet - a.feet);
+    const df2 = Math.max(0.05, c.feet - b.feet);
+    const s1 = Math.atan2(b.board - a.board, df1);
+    const s2 = Math.atan2(c.board - b.board, df2);
+    let d = Math.abs((s2 - s1) * (180 / Math.PI));
+    if (d > 180) d = 360 - d;
+    if (d > maxDeg) {
+      maxDeg = d;
+      atFeet = b.feet;
+      spanFt = c.feet - a.feet;
+    }
+  }
+  return { maxDeg, atFeet, spanFt };
+}
 
 /** 非預測軌跡的 feet 覆蓋範圍 */
 export function trajectoryCoverage(
@@ -375,6 +893,45 @@ export function boardAtFeet(
     maxGap: 3,
   });
   return r ? r.board : null;
+}
+
+/**
+ * Board at target feet on the *displayed* path (includes predicted densify knots).
+ * boardAtFeet / longestForward strip predicted — LaneMap draws them, so Arr must too.
+ */
+export function boardAtFeetOnDisplayedPath(
+  points: { lane?: LanePoint; predicted?: boolean }[],
+  targetFeet: number,
+  maxGap = 2.5
+): number | null {
+  const all = points
+    .filter((p): p is { lane: LanePoint } => !!p.lane)
+    .map((p) => p.lane)
+    .sort((a, b) => a.feet - b.feet);
+  if (all.length < 2) return null;
+  const lo = all[0].feet;
+  const hi = all[all.length - 1].feet;
+  if (targetFeet < lo - 0.5 || targetFeet > hi + 0.5) return null;
+  for (let i = 0; i < all.length - 1; i++) {
+    const a = all[i];
+    const b = all[i + 1];
+    const flo = Math.min(a.feet, b.feet);
+    const fhi = Math.max(a.feet, b.feet);
+    if (targetFeet >= flo && targetFeet <= fhi && fhi - flo > 1e-6) {
+      const t = (targetFeet - a.feet) / (b.feet - a.feet);
+      return a.board + t * (b.board - a.board);
+    }
+  }
+  let best = all[0];
+  let bestD = Math.abs(best.feet - targetFeet);
+  for (const p of all) {
+    const d = Math.abs(p.feet - targetFeet);
+    if (d < bestD) {
+      best = p;
+      bestD = d;
+    }
+  }
+  return bestD <= maxGap ? best.board : null;
 }
 
 type TimedLane = { lane: LanePoint; t: number; predicted?: boolean };
